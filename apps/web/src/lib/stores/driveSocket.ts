@@ -6,7 +6,7 @@
  */
 
 import { writable, get } from 'svelte/store';
-import type { DriveSessionState, VehicleTelemetry, CameraView, DriveMessage, VehicleOption, SpawnableObject, PlacedObject, ScenarioInfo, V2xSignal, V2xAlert, V2xZone, TrajectoryInfo, TrajectoryStatus } from '$lib/types';
+import type { DriveSessionState, VehicleTelemetry, CameraView, DriveMessage, VehicleOption, SpawnableObject, PlacedObject, ScenarioInfo, V2xSignal, V2xAlert, V2xZone, TrajectoryInfo, TrajectoryStatus, XoscScenarioInfo, XoscRunnerStatus, XoscEvent, XoscFinishedEvent, DynamicActor } from '$lib/types';
 import { v2xZones } from './v2xZones';
 
 // ── Stores ──
@@ -42,6 +42,19 @@ export const v2xSignalCount = writable<number>(0);
 export const v2xAlerts = writable<V2xAlert[]>([]);
 export const trajectoryList = writable<TrajectoryInfo[]>([]);
 export const trajectoryStatus = writable<TrajectoryStatus>({ active: false });
+export const dynamicActors = writable<DynamicActor[]>([]);
+
+// OpenSCENARIO (.xosc) state
+export const xoscScenarioList = writable<XoscScenarioInfo[]>([]);
+export const xoscRunnerStatus = writable<XoscRunnerStatus>({
+	running: false,
+	file: null,
+	scenario_runner_configured: false,
+});
+export const xoscEventLog = writable<XoscEvent[]>([]);
+export const xoscLastResult = writable<XoscFinishedEvent | null>(null);
+
+const XOSC_LOG_MAX = 500;
 
 // ── WebSocket ──
 
@@ -91,6 +104,7 @@ export function connect(wsUrl: string): void {
 			console.log('[DriveWS] Session lost — resetting to idle');
 			sessionState.set('idle');
 			vehicleId.set(null);
+			dynamicActors.set([]);
 		}
 	};
 
@@ -108,6 +122,7 @@ export function disconnect(): void {
 	driveConnected.set(false);
 	sessionState.set('idle');
 	vehicleId.set(null);
+	dynamicActors.set([]);
 }
 
 // ── Message Handling ──
@@ -122,18 +137,31 @@ function handleServerMessage(msg: DriveMessage): void {
 
 		case 'telemetry':
 			telemetry.set(msg as unknown as VehicleTelemetry);
+			dynamicActors.set(Array.isArray(msg.dynamic_actors) ? (msg.dynamic_actors as DynamicActor[]) : []);
 			// If we receive telemetry, we're actively driving
 			if (get(sessionState) === 'ready') {
 				sessionState.set('driving');
 			}
-			// Handle V2X proximity alerts from telemetry
+			// Handle V2X proximity alerts from telemetry. Bridge re-broadcasts
+			// every tick, so we dedup by `id` here: an incoming alert with an
+			// id we already have updates that toast's distance in place; new
+			// ids become a fresh toast. `_lastSeen` is set every update so
+			// V2xToast can auto-dismiss alerts that stop arriving.
 			if (msg.v2x_alerts) {
+				const incoming = msg.v2x_alerts as V2xAlert[];
+				const now = Date.now();
 				v2xAlerts.update(existing => {
-					const newAlerts = (msg.v2x_alerts as V2xAlert[]).map(a => ({
-						...a,
-						_uid: Date.now() + Math.random(),
-					}));
-					return [...existing, ...newAlerts];
+					const byId = new Map<number, V2xAlert>();
+					for (const e of existing) byId.set(e.id, e);
+					for (const a of incoming) {
+						const prev = byId.get(a.id);
+						if (prev) {
+							byId.set(a.id, { ...prev, ...a, _lastSeen: now } as V2xAlert);
+						} else {
+							byId.set(a.id, { ...a, _uid: now + Math.random(), _lastSeen: now } as V2xAlert);
+						}
+					}
+					return Array.from(byId.values());
 				});
 			}
 			break;
@@ -141,6 +169,7 @@ function handleServerMessage(msg: DriveMessage): void {
 		case 'session_ended':
 			sessionState.set('idle');
 			vehicleId.set(null);
+			dynamicActors.set([]);
 			break;
 
 		case 'vehicle_list':
@@ -187,6 +216,50 @@ function handleServerMessage(msg: DriveMessage): void {
 
 		case 'scenario_deleted':
 			requestScenarios();
+			break;
+
+		case 'xosc_list':
+			xoscScenarioList.set((msg.scenarios as XoscScenarioInfo[]) ?? []);
+			if (msg.status) {
+				xoscRunnerStatus.set(msg.status as XoscRunnerStatus);
+			}
+			break;
+
+		case 'xosc_started':
+			xoscRunnerStatus.update(s => ({
+				...s,
+				running: true,
+				file: (msg.file as string) ?? null,
+				started_at: (msg.started_at as number) ?? Date.now() / 1000,
+				exit_code: null,
+			}));
+			xoscEventLog.set([]);
+			xoscLastResult.set(null);
+			break;
+
+		case 'xosc_event':
+			xoscEventLog.update(log => {
+				const next = [...log, { line: msg.line as string, ts: msg.ts as number }];
+				return next.length > XOSC_LOG_MAX ? next.slice(-XOSC_LOG_MAX) : next;
+			});
+			break;
+
+		case 'xosc_finished':
+			xoscRunnerStatus.update(s => ({
+				...s,
+				running: false,
+				exit_code: (msg.exit_code as number) ?? null,
+			}));
+			xoscLastResult.set({
+				file: (msg.file as string) ?? null,
+				exit_code: (msg.exit_code as number) ?? null,
+				verdict: (msg.verdict as 'SUCCESS' | 'FAILURE') ?? 'FAILURE',
+				duration_sec: (msg.duration_sec as number) ?? 0,
+			});
+			break;
+
+		case 'xosc_stopped':
+			xoscRunnerStatus.update(s => ({ ...s, running: false }));
 			break;
 
 		case 'camera_switched':
@@ -241,6 +314,35 @@ function handleServerMessage(msg: DriveMessage): void {
 			requestTrajectories();
 			break;
 
+		case 'non_ego_vehicles_cleared':
+			// Server side handles the destruction; UI updates via the next telemetry tick.
+			break;
+
+		case 'dynamic_actor_spawned':
+			dynamicActors.update(list => {
+				const actor = msg.actor;
+				if (
+					typeof actor !== 'object' ||
+					actor === null ||
+					typeof (actor as DynamicActor).actor_id !== 'number' ||
+					typeof (actor as DynamicActor).blueprint !== 'string'
+				) {
+					return list;
+				}
+				const dynamicActor = actor as DynamicActor;
+				return [...list.filter(a => a.actor_id !== dynamicActor.actor_id), dynamicActor];
+			});
+			break;
+
+		case 'dynamic_actor_despawned':
+		case 'dynamic_actor_missing':
+			dynamicActors.update(list => list.filter(a => a.actor_id !== (msg.actor_id as number)));
+			break;
+
+		case 'dynamic_actors_despawned':
+			dynamicActors.set([]);
+			break;
+
 		case 'error':
 			lastError.set(msg.message as string);
 			if (get(sessionState) === 'reconstructing') {
@@ -285,12 +387,33 @@ export function respawnVehicle(): void {
 	send({ type: 'respawn' });
 }
 
+export function clearNonEgoVehicles(): void {
+	send({ type: 'clear_non_ego_vehicles' });
+}
+
 export function requestObjects(): void {
 	send({ type: 'list_objects' });
 }
 
 export function spawnObject(blueprint: string, offset: number = 8.0): void {
 	send({ type: 'spawn_object', blueprint, offset });
+}
+
+export function spawnDynamicActor(
+	blueprint: string,
+	geofenceRadius: number = 35,
+	message: string = ''
+): void {
+	const radius = Math.max(5, Math.min(250, Number.isFinite(geofenceRadius) ? geofenceRadius : 35));
+	send({ type: 'spawn_dynamic_actor', blueprint, geofence_radius: radius, message });
+}
+
+export function despawnDynamicActor(actorId: number): void {
+	send({ type: 'despawn_dynamic_actor', actor_id: actorId });
+}
+
+export function despawnDynamicActors(): void {
+	send({ type: 'despawn_dynamic_actors' });
 }
 
 export function undoPlace(): void {
@@ -311,6 +434,20 @@ export function loadScenario(file: string): void {
 
 export function deleteScenario(file: string): void {
 	send({ type: 'delete_scenario', file });
+}
+
+// ── OpenSCENARIO (.xosc) Actions ──
+
+export function requestXoscScenarios(): void {
+	send({ type: 'list_xosc_scenarios' });
+}
+
+export function startXoscScenario(file: string): void {
+	send({ type: 'start_xosc_scenario', file });
+}
+
+export function stopXoscScenario(): void {
+	send({ type: 'stop_xosc_scenario' });
 }
 
 export function endSession(): void {
@@ -362,7 +499,7 @@ export function despawnTraffic(): void {
 
 // ── V2X Zone Actions ──
 
-export function syncV2xZones(zones: { polygon: [number, number][]; signal_type: string; color: string }[]): void {
+export function syncV2xZones(zones: { polygon: [number, number][]; zone_kind?: string; signal_type: string; color: string }[]): void {
 	send({ type: 'sync_v2x_zones', zones });
 }
 
@@ -387,4 +524,3 @@ export function stopTrajectory(): void {
 export function requestTrajectoryStatus(): void {
 	send({ type: 'trajectory_status' });
 }
-

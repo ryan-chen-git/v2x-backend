@@ -33,6 +33,7 @@ from digital_twin_bridge.config import Config
 from digital_twin_bridge.carla_connection import CarlaConnection
 from digital_twin_bridge.drive_server import serve_drive, _active_sessions
 from digital_twin_bridge.trajectory_player import TrajectoryPlayer
+from digital_twin_bridge.openscenario_runner import OpenScenarioRunner
 
 logger = logging.getLogger(__name__)
 
@@ -157,36 +158,14 @@ async def main():
             except Exception as e:
                 logger.debug("Prop destroy failed (id=%d): %s", actor.id, e)
 
-    # ── V2X: fetch snapshot and spawn props ──
-    # Shared pool of V2X props (object_id -> actor_id). Seeded by the boot
-    # snapshot and extended by each session's scene reconstruction. Never
-    # destroyed on session end — only at server shutdown — so props survive
-    # across sessions and between drivers in multiplayer.
+    # ── V2X props: boot spawn disabled ──
+    # PropSpawner is intentionally not invoked here. Production V2X
+    # detections were landing traffic cones on the road in the firetruck
+    # scenarios' paths. To re-enable, restore the fetch_v2x_snapshot() +
+    # PropSpawner(world, carla_map).sync(registry) block from git history;
+    # the spawner module (prop_spawner.py) is still available unchanged.
     shared_prop_pool: dict[str, int] = {}
     registry = None
-    detections = fetch_v2x_snapshot(config)
-    if detections:
-        from digital_twin_bridge.object_registry import ObjectRegistry
-        from digital_twin_bridge.prop_spawner import PropSpawner
-        from digital_twin_bridge.geo_utils import gps_to_carla
-
-        registry = ObjectRegistry()
-        registry.update_from_v2x(detections)
-
-        for obj in registry.get_all():
-            try:
-                obj.carla_location = gps_to_carla(carla_map, obj.lat, obj.lon)
-            except Exception:
-                logger.debug("Failed to resolve location for %s", obj.object_id)
-
-        spawner = PropSpawner(world, carla_map)
-        spawned = spawner.sync(registry)
-        # Seed the shared pool with the boot snapshot so session reconstructors
-        # skip objects we've already placed.
-        for obj in registry.get_all():
-            if obj.carla_actor_id is not None:
-                shared_prop_pool[obj.object_id] = obj.carla_actor_id
-        logger.info("Spawned %d V2X props in CARLA world (pool=%d)", spawned, len(shared_prop_pool))
 
     # ── Map data: export road network to S3 ──
     uplink = None
@@ -214,26 +193,57 @@ async def main():
     # ── Trajectory player (singleton: one playback at a time, shared world) ──
     trajectory_player = TrajectoryPlayer(world, carla_map)
 
+    # ── OpenSCENARIO runner (singleton: one .xosc at a time across all sessions) ──
+    openscenario_runner = OpenScenarioRunner(
+        scenario_runner_path=config.SCENARIO_RUNNER_PATH,
+        carla_host=config.CARLA_HOST,
+        carla_port=config.CARLA_PORT,
+        python_executable=config.SCENARIO_RUNNER_PYTHON or None,
+        pythonpath_prefix=config.SCENARIO_RUNNER_PYTHONPATH,
+        world=world,
+    )
+
     # ── Drive server setup ──
     api_fetcher = make_api_fetcher(config)
 
     async def handler(websocket):
         await serve_drive(
             websocket, world, carla_map, api_fetcher,
-            shared_prop_pool, trajectory_player,
+            shared_prop_pool, trajectory_player, openscenario_runner,
+            eva_warning_distance_m=config.EVA_WARNING_DISTANCE_M,
         )
 
     async def tick_loop():
         """Advance CARLA physics at 20 Hz.
 
-        In sync mode the world does not tick on its own. We wrap the
-        blocking tick() in run_in_executor so it doesn't stall asyncio.
-        After each tick, drive the trajectory player one step so its
-        controller stays in lockstep with sim time.
+        In sync mode the world does not tick on its own; we drive it from
+        here. While ScenarioRunner is running it owns the tick (launched
+        with --sync, locally patched to pace at 20 Hz wall-time so user
+        controls feel normal). The bridge yields its tick during that
+        window. SR turns sync mode off on exit, so we re-arm it before
+        resuming. After each bridge tick we step the trajectory player so
+        its controller stays in lockstep with sim time.
         """
         loop = asyncio.get_running_loop()
         target_dt = 0.05
+        was_running = False
         while True:
+            if openscenario_runner.is_running:
+                was_running = True
+                await asyncio.sleep(target_dt)
+                continue
+            if was_running:
+                try:
+                    settings = world.get_settings()
+                    if not settings.synchronous_mode:
+                        settings.synchronous_mode = True
+                        settings.fixed_delta_seconds = target_dt
+                        world.apply_settings(settings)
+                        logger.info("Re-applied sync mode after scenario finished")
+                except Exception as e:
+                    logger.warning("Failed to restore sync mode after scenario: %s", e)
+                was_running = False
+
             start = loop.time()
             try:
                 await loop.run_in_executor(None, world.tick)
@@ -301,7 +311,7 @@ async def main():
     logger.info("=" * 60)
     logger.info("  CARLA       : %s:%d (sync mode, 20 Hz)", config.CARLA_HOST, config.CARLA_PORT)
     logger.info("  Drive WS    : ws://0.0.0.0:%d", port)
-    logger.info("  V2X objects : %d tracked", len(detections))
+    logger.info("  V2X objects : %d tracked", len(shared_prop_pool))
     logger.info("  State pub   : %s", "active" if uplink else "disabled (no AWS)")
     logger.info("=" * 60)
 
@@ -342,6 +352,12 @@ async def main():
             trajectory_player.stop()
         except Exception as e:
             logger.debug("Trajectory stop on shutdown failed: %s", e)
+
+        # Stop any running OpenSCENARIO subprocess.
+        try:
+            openscenario_runner.stop()
+        except Exception as e:
+            logger.debug("OpenSCENARIO stop on shutdown failed: %s", e)
 
         # Destroy shared V2X props (owned by the server, not any session).
         if shared_prop_pool:

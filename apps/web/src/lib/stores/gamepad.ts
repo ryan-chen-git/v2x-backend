@@ -2,19 +2,15 @@
  * Gamepad Store — steering wheel + pedal input via the browser Gamepad API.
  *
  * Pedal normalization strategy:
- *   The G923's pedal axes swing between -1 and +1, but the rest position
- *   can be either end and varies between sessions. Instead of guessing the
- *   rest value from an unreliable initial snapshot, we:
+ *   G923 pedals always rest at +1.0 and travel toward -1.0 when pressed, so
+ *   trackers are seeded with `DEFAULT_CALIBRATION.gasRest`/`brakeRest` and
+ *   `detected=true` at module load. Input is live the moment the page loads.
  *
- *   1. Output zeros until we're confident about the mapping.
- *   2. On each poll frame, track the min and max values seen per pedal axis.
- *   3. Once we've seen a full-range sweep (max - min > 1.0), the pedal has
- *      been pressed and released. At that point, the current value is at rest.
- *   4. Fallback: if 120 frames (~2s) pass without a sweep, snapshot whatever
- *      extreme the axis is at now (driver should have stabilized by then).
- *
- * Only axis assignments are persisted to localStorage. Inversion is always
- * re-detected at runtime.
+ *   Sweep-detection only runs when the user remaps an axis via the wizard,
+ *   since the new axis's rest value is unknown. After remap,
+ *   `recalibrateRestValues()` flips trackers back into detect mode and the
+ *   poll loop captures the new rest from a full press+release sweep (or a
+ *   2 s fallback at an extreme).
  */
 
 import { writable, derived, get } from 'svelte/store';
@@ -28,6 +24,14 @@ export const gamepadName = writable<string>('');
 export const gamepadIndex = writable<number>(-1);
 export const rawAxes = writable<number[]>([]);
 export const rawButtons = writable<boolean[]>([]);
+
+// Wheel reverse gear. The G923 has no reverse pedal, so a face button
+// stands in for the gear stick. Press once → R, press again → D. The
+// gas pedal magnitude carries through unchanged; the bridge interprets
+// `reverse=true` and drives the throttle backward.
+const REVERSE_BUTTON_INDEX = 0; // PS X / Xbox A — first face button
+export const wheelReverseGear = writable<boolean>(false);
+let _prevReverseButtonPressed = false;
 
 // ── Calibration (persisted) ──
 
@@ -84,8 +88,14 @@ interface PedalTracker {
 	detected: boolean;
 }
 
-let gas: PedalTracker = { min: Infinity, max: -Infinity, rest: 0, detected: false };
-let brake: PedalTracker = { min: Infinity, max: -Infinity, rest: 0, detected: false };
+let gas: PedalTracker = {
+	min: Infinity, max: -Infinity,
+	rest: DEFAULT_CALIBRATION.gasRest, detected: true,
+};
+let brake: PedalTracker = {
+	min: Infinity, max: -Infinity,
+	rest: DEFAULT_CALIBRATION.brakeRest, detected: true,
+};
 let framesPolled = 0;
 
 const SWEEP_THRESHOLD = 1.0;   // min-max range that confirms a full press+release
@@ -151,8 +161,8 @@ function normalizePedal(raw: number, rest: number): number {
 }
 
 export const normalizedInput = derived(
-	[rawAxes, calibration],
-	([$rawAxes, $cal]): NormalizedInput => {
+	[rawAxes, calibration, wheelReverseGear],
+	([$rawAxes, $cal, $reverse]): NormalizedInput => {
 		if ($rawAxes.length === 0 || !gas.detected) {
 			return { steer: 0, throttle: 0, brake: 0, reverse: false };
 		}
@@ -162,7 +172,19 @@ export const normalizedInput = derived(
 			? -($rawAxes[$cal.steerAxis] ?? 0)
 			: ($rawAxes[$cal.steerAxis] ?? 0);
 		if (Math.abs(steer) < GAMEPAD_DEADZONE) steer = 0;
-		steer = Math.max(-1, Math.min(1, steer));
+		// Non-linear curve: gentle near center, ramps toward full lock.
+		// Mirrors CARLA's manual_control_steeringwheel.py G29 mapping
+		// (`K1 * tan(1.1 * input)`, K1 = 0.55). At quarter-turn the
+		// actual steer command is ~0.15 instead of 0.25, which keeps
+		// lateral force inside the tire's grip envelope at speed.
+		if (steer !== 0) {
+			steer = 0.55 * Math.tan(1.1 * steer);
+		}
+		// Cap at ±0.7 — matches manual_control.py line 616
+		// (`min(0.7, max(-0.7, steer))`). Full lock is 0.7, not 1.0,
+		// which is the single biggest reason that example feels grippier
+		// than ours did with raw ±1.0 steering.
+		steer = Math.max(-0.7, Math.min(0.7, steer));
 
 		// Pedals
 		let throttle = normalizePedal($rawAxes[$cal.gasAxis] ?? 0, gas.rest);
@@ -172,7 +194,7 @@ export const normalizedInput = derived(
 		if (throttle < GAMEPAD_DEADZONE) throttle = 0;
 		if (brakeVal < GAMEPAD_DEADZONE) brakeVal = 0;
 
-		return { steer, throttle, brake: brakeVal, reverse: false };
+		return { steer, throttle, brake: brakeVal, reverse: $reverse };
 	}
 );
 
@@ -189,7 +211,18 @@ function poll() {
 	}
 
 	rawAxes.set([...gp.axes]);
-	rawButtons.set(gp.buttons.map((b) => b.pressed));
+	const buttonsPressed = gp.buttons.map((b) => b.pressed);
+	rawButtons.set(buttonsPressed);
+
+	// Edge-trigger reverse-gear toggle on the dedicated button. Press
+	// once → R, press again → D. State sticks across frames the way the
+	// keyboard's S-key gear does — releasing the button doesn't shift
+	// out of R, only pressing again does.
+	const reversePressed = buttonsPressed[REVERSE_BUTTON_INDEX] ?? false;
+	if (reversePressed && !_prevReverseButtonPressed) {
+		wheelReverseGear.update((r) => !r);
+	}
+	_prevReverseButtonPressed = reversePressed;
 
 	// Update pedal detection
 	if (!gas.detected || !brake.detected) {
@@ -224,7 +257,6 @@ export function startPolling(): void {
 			gamepadIndex.set(gp.index);
 			gamepadConnected.set(true);
 			gamepadName.set(gp.id);
-			resetDetection();
 			break;
 		}
 	}
@@ -239,6 +271,8 @@ export function stopPolling(): void {
 	}
 	window.removeEventListener('gamepadconnected', onConnect);
 	window.removeEventListener('gamepaddisconnected', onDisconnect);
+	wheelReverseGear.set(false);
+	_prevReverseButtonPressed = false;
 }
 
 /**
@@ -250,6 +284,24 @@ export function recalibrateRestValues(): void {
 	resetDetection();
 }
 
+/**
+ * Apply the hardcoded G923 rest values without running detection. Used by
+ * the wizard's Skip path so input is live immediately and a held pedal can't
+ * be miscaptured as the rest position.
+ */
+export function applyDefaultRests(): void {
+	gas = {
+		min: Infinity, max: -Infinity,
+		rest: DEFAULT_CALIBRATION.gasRest, detected: true,
+	};
+	brake = {
+		min: Infinity, max: -Infinity,
+		rest: DEFAULT_CALIBRATION.brakeRest, detected: true,
+	};
+	framesPolled = 0;
+	calibrated.set(true);
+}
+
 // ── Event Handlers ──
 
 function onConnect(e: GamepadEvent) {
@@ -257,7 +309,6 @@ function onConnect(e: GamepadEvent) {
 	gamepadConnected.set(true);
 	gamepadName.set(e.gamepad.id);
 	console.log(`[Gamepad] Connected: ${e.gamepad.id} (${e.gamepad.axes.length} axes, ${e.gamepad.buttons.length} buttons)`);
-	resetDetection();
 }
 
 function onDisconnect(e: GamepadEvent) {

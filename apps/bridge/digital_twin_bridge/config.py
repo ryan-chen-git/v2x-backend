@@ -52,6 +52,23 @@ class Config:
     WEBRTC_PORT: int = 8766
     SESSION_DIR: str = "sessions/"
 
+    # OpenSCENARIO / ScenarioRunner — absolute path to the cloned
+    # https://github.com/carla-simulator/scenario_runner repo on the dev PC.
+    # Empty string disables the feature.
+    SCENARIO_RUNNER_PATH: str = ""
+    # Python interpreter used to launch scenario_runner.py. Empty → use
+    # the bridge's own interpreter (sys.executable).
+    SCENARIO_RUNNER_PYTHON: str = ""
+    # Colon-separated paths prepended to PYTHONPATH for the subprocess.
+    # Typically points to the CARLA PythonAPI's `carla/` directory so
+    # ScenarioRunner can import the `agents` package.
+    SCENARIO_RUNNER_PYTHONPATH: str = ""
+
+    # Distance (meters) within which an approaching emergency vehicle
+    # (vehicle.carlamotors.firetruck) triggers a "pull over" v2x_alert toast
+    # on the ego's browser. Only fires when the EVA is closing on the ego.
+    EVA_WARNING_DISTANCE_M: float = 20.0
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

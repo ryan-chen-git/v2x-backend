@@ -7,7 +7,9 @@ so unit tests run fast without real CARLA or network access.
 
 import json
 import asyncio
+import sys
 import time
+import types
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -69,6 +71,8 @@ class MockActor:
         self._control = MockVehicleControl()
         self._velocity = MockLocation(x=0, y=0, z=0)
         self._destroyed = False
+        self.autopilot_enabled = False
+        self.traffic_manager_port: Optional[int] = None
         self.control_history: list[MockVehicleControl] = []
 
     def get_transform(self) -> MockTransform:
@@ -97,6 +101,10 @@ class MockActor:
     def set_transform(self, transform: MockTransform) -> None:
         self._transform = transform
 
+    def set_autopilot(self, enabled: bool, tm_port: Optional[int] = None) -> None:
+        self.autopilot_enabled = enabled
+        self.traffic_manager_port = tm_port
+
     def destroy(self) -> bool:
         self._destroyed = True
         return True
@@ -106,18 +114,41 @@ class MockActor:
         return self._destroyed
 
 
+class MockBlueprintAttribute:
+    def __init__(self, value: str, recommended_values: Optional[list[str]] = None):
+        self.value = value
+        self.recommended_values = recommended_values or [value]
+
+    def __int__(self) -> int:
+        return int(self.value)
+
+    def __str__(self) -> str:
+        return self.value
+
+
 class MockBlueprint:
-    def __init__(self, bp_id: str):
+    def __init__(self, bp_id: str, attributes: Optional[dict[str, MockBlueprintAttribute]] = None):
         self.id = bp_id
+        self._attributes = attributes or {}
+        if bp_id.startswith("vehicle."):
+            self._attributes.setdefault("number_of_wheels", MockBlueprintAttribute("4"))
+            self._attributes.setdefault("color", MockBlueprintAttribute("255,255,255", ["255,255,255", "180,0,0"]))
+
+    def has_attribute(self, key: str) -> bool:
+        return key in self._attributes
+
+    def get_attribute(self, key: str) -> MockBlueprintAttribute:
+        return self._attributes[key]
 
     def set_attribute(self, key: str, value: str) -> None:
-        pass
+        self._attributes[key] = MockBlueprintAttribute(value)
 
 
 class MockBlueprintLibrary:
     def __init__(self):
         self._blueprints = {
             "vehicle.tesla.model3": MockBlueprint("vehicle.tesla.model3"),
+            "vehicle.carlamotors.firetruck": MockBlueprint("vehicle.carlamotors.firetruck"),
             "static.prop.trafficcone01": MockBlueprint("static.prop.trafficcone01"),
             "static.prop.trafficwarning": MockBlueprint("static.prop.trafficwarning"),
             "sensor.camera.rgb": MockBlueprint("sensor.camera.rgb"),
@@ -152,6 +183,8 @@ class MockMap:
         return [
             MockTransform(MockLocation(100, 200, 0), MockRotation(0, 0, 0)),
             MockTransform(MockLocation(150, 250, 0), MockRotation(0, 90, 0)),
+            MockTransform(MockLocation(200, 300, 0), MockRotation(0, 180, 0)),
+            MockTransform(MockLocation(250, 350, 0), MockRotation(0, 270, 0)),
         ]
 
     def transform_to_geolocation(self, location: MockLocation) -> MockGeoLocation:
@@ -247,18 +280,78 @@ class MockWorld:
         return [a for a in self._actors.values() if a.id != 0]
 
 
+class MockTrafficManager:
+    def __init__(self, port: int = 8000):
+        self._port = port
+        self.synchronous_mode = False
+        self.speed_difference = 0.0
+        self.distance_to_leading_vehicle = 2.0
+        self.ignore_lights: dict[int, float] = {}
+        self.ignore_signs: dict[int, float] = {}
+
+    def get_port(self) -> int:
+        return self._port
+
+    def set_synchronous_mode(self, enabled: bool) -> None:
+        self.synchronous_mode = enabled
+
+    def global_percentage_speed_difference(self, value: float) -> None:
+        self.speed_difference = value
+
+    def set_global_distance_to_leading_vehicle(self, value: float) -> None:
+        self.distance_to_leading_vehicle = value
+
+    def ignore_lights_percentage(self, actor: MockActor, value: float) -> None:
+        self.ignore_lights[actor.id] = value
+
+    def ignore_signs_percentage(self, actor: MockActor, value: float) -> None:
+        self.ignore_signs[actor.id] = value
+
+
 class MockClient:
     """Mock CARLA client."""
 
     def __init__(self, world: Optional[MockWorld] = None):
         self._world = world or MockWorld()
         self._timeout = 10.0
+        self._traffic_manager = MockTrafficManager()
 
     def get_world(self) -> MockWorld:
         return self._world
 
     def set_timeout(self, seconds: float) -> None:
         self._timeout = seconds
+
+    def get_trafficmanager(self) -> MockTrafficManager:
+        return self._traffic_manager
+
+
+class MockCarlaClient(MockClient):
+    """Drop-in carla.Client test double accepting CARLA's host/port signature."""
+
+    def __init__(self, *args, **kwargs):
+        world = args[0] if args and isinstance(args[0], MockWorld) else None
+        super().__init__(world)
+
+
+def _install_fake_carla_module() -> None:
+    if "carla" in sys.modules:
+        return
+
+    fake_carla = types.ModuleType("carla")
+    fake_carla.Location = MockLocation
+    fake_carla.Rotation = MockRotation
+    fake_carla.Transform = MockTransform
+    fake_carla.VehicleControl = MockVehicleControl
+    fake_carla.Vector3D = MockLocation
+    fake_carla.Client = MockCarlaClient
+    fake_carla.Map = MockMap
+    fake_carla.World = MockWorld
+    fake_carla.Vehicle = MockActor
+    sys.modules["carla"] = fake_carla
+
+
+_install_fake_carla_module()
 
 
 # ──────────────────────────────────────────────────────────────

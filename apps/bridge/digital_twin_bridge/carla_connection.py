@@ -65,12 +65,28 @@ class CarlaConnection:
             time.sleep(0.5)
             self._original_settings = self._world.get_settings()
 
-        # Enable synchronous mode with a fixed delta
+        # Enable synchronous mode with a fixed delta.
         settings = self._world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 Hz simulation
         self._world.apply_settings(settings)
         self._client.set_timeout(10.0)
+
+        # Bright noon at connect — without this, get_weather() returns
+        # WeatherParameters() defaults (sun_altitude_angle=0, dark). Once a
+        # scenario runs, its <EnvironmentAction> overrides this and the new
+        # weather persists past scenario end (no bridge-side restore).
+        self._world.set_weather(carla.WeatherParameters(
+            cloudiness=0.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            wind_intensity=30.0,
+            sun_azimuth_angle=180.0,
+            sun_altitude_angle=75.0,
+            fog_density=0.0,
+            fog_distance=100000.0,
+            wetness=0.0,
+        ))
 
         logger.info(
             "Connected to CARLA. Map: %s | Sync mode enabled.",

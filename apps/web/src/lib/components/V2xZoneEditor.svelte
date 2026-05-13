@@ -7,7 +7,8 @@
 	import { fetchMapDataFull, type MapDataResponse } from '$lib/api';
 	import { v2xZones, addZone, removeZone, updateZone } from '$lib/stores/v2xZones';
 	import { saveScenario, driveConnected } from '$lib/stores/driveSocket';
-	import type { V2xZone } from '$lib/types';
+	import { DEFAULT_ZONE_COLORS } from '$lib/zoneRules';
+	import type { V2xZone, V2xZoneKind } from '$lib/types';
 
 	interface Props {
 		onclose: () => void;
@@ -23,16 +24,10 @@
 	let editingZoneId = $state<string | null>(null);
 	let zoneName = $state('');
 	let zoneMessage = $state('');
-	let zoneType = $state<'warning' | 'info' | 'alert'>('warning');
+	let zoneKind = $state<V2xZoneKind>('geofence');
 	let showSaveDialog = $state(false);
 	let scenarioNameInput = $state('');
 	let saveStatus = $state<string>('');
-
-	const ZONE_COLORS: Record<string, string> = {
-		warning: '#ef4444',
-		alert: '#f97316',
-		info: '#3b82f6',
-	};
 
 	let zones = $derived($v2xZones);
 
@@ -160,9 +155,10 @@
 				id: Math.random().toString(36).slice(2) + Date.now().toString(36),
 				name: `Zone ${zones.length + 1}`,
 				message: '',
+				zone_kind: 'geofence',
 				signal_type: 'warning',
 				polygon: coords,
-				color: ZONE_COLORS.warning,
+				color: DEFAULT_ZONE_COLORS.geofence,
 			};
 
 			addZone(newZone);
@@ -181,7 +177,7 @@
 			editingZoneId = newZone.id;
 			zoneName = newZone.name;
 			zoneMessage = newZone.message;
-			zoneType = newZone.signal_type;
+			zoneKind = newZone.zone_kind;
 		});
 
 		draw.on('change', (ids: any, type: any) => {
@@ -212,7 +208,7 @@
 		editingZoneId = zone.id;
 		zoneName = zone.name;
 		zoneMessage = zone.message;
-		zoneType = zone.signal_type;
+		zoneKind = zone.zone_kind;
 	}
 
 	function saveZoneEdit() {
@@ -220,8 +216,9 @@
 		updateZone(editingZoneId, {
 			name: zoneName,
 			message: zoneMessage,
-			signal_type: zoneType,
-			color: ZONE_COLORS[zoneType],
+			zone_kind: zoneKind,
+			signal_type: 'warning',
+			color: DEFAULT_ZONE_COLORS[zoneKind],
 		});
 		editingZoneId = null;
 		refreshZonesLayer();
@@ -282,10 +279,15 @@
 					properties: {
 						id: z.id,
 						name: z.name,
+						zone_kind: z.zone_kind,
 						color: z.color,
 					},
 				})),
 		};
+	}
+
+	function zoneKindLabel(zone: V2xZone): string {
+		return zone.zone_kind === 'geofence' ? 'Geo-fence' : 'Warning';
 	}
 
 	onDestroy(() => {
@@ -339,9 +341,9 @@
 		<!-- Instructions -->
 		<div class="absolute bottom-4 left-4 z-10 rounded-lg border border-gray-700/50 bg-gray-900/90 px-3 py-2 text-xs text-gray-400 backdrop-blur-sm">
 			{#if activeTool === 'rectangle'}
-				Click and drag to draw a V2X zone rectangle
+				Click and drag to draw a V2X zone rectangle. Set it as a warning or geo-fence in the side panel.
 			{:else if activeTool === 'polygon'}
-				Click to place vertices, double-click to finish polygon
+				Click to place vertices, double-click to finish polygon. Set it as a warning or geo-fence in the side panel.
 			{:else}
 				Click a zone to select, drag to move
 			{/if}
@@ -382,12 +384,11 @@
 								class="rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-white placeholder:text-gray-600 focus:border-blue-500 focus:outline-none"
 							></textarea>
 							<select
-								bind:value={zoneType}
+								bind:value={zoneKind}
 								class="rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
 							>
-								<option value="warning">Warning (red)</option>
-								<option value="alert">Alert (orange)</option>
-								<option value="info">Info (blue)</option>
+								<option value="geofence">Geo-fence (draws boundary)</option>
+								<option value="warning">Warning (notification only)</option>
 							</select>
 							<div class="flex gap-1">
 								<button
@@ -416,6 +417,7 @@
 									style="background-color: {zone.color};"
 								></span>
 								<span class="text-xs font-medium text-white">{zone.name}</span>
+								<span class="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-400">{zoneKindLabel(zone)}</span>
 							</div>
 							{#if zone.message}
 								<p class="mt-0.5 truncate pl-5 text-xs text-gray-500">{zone.message}</p>

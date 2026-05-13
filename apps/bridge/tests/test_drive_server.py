@@ -395,3 +395,137 @@ class TestScenarioZonePersistence:
         assert response["placed_count"] == 0
         # Should NOT have spawned objects when session is inactive
         session.load_scenario_objects.assert_not_called()
+
+
+@pytest.mark.unit
+class TestDynamicActorGeofences:
+    @pytest.mark.asyncio
+    async def test_spawn_dynamic_actor_sets_autopilot_and_emits_telemetry(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+
+        result = session.spawn_dynamic_actor(
+            blueprint_id="vehicle.carlamotors.firetruck",
+            geofence_radius=42.0,
+            message="Firefighter response vehicle active",
+        )
+
+        assert result["type"] == "dynamic_actor_spawned"
+        actor_id = result["actor"]["actor_id"]
+        actor = mock_world.get_actor(actor_id)
+        assert actor is not None
+        assert actor.type_id == "vehicle.carlamotors.firetruck"
+        assert actor.autopilot_enabled is True
+        assert actor.traffic_manager_port == 8000
+        assert result["actor"]["geofence_radius"] == 42.0
+
+        telemetry = session.apply_control(steer=0.0, throttle=0.0, brake=0.0)
+        assert telemetry["dynamic_actors"][0]["actor_id"] == actor_id
+        assert telemetry["dynamic_actors"][0]["message"] == "Firefighter response vehicle active"
+        assert telemetry["nearby_actors"][0]["type"] == "dynamic"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_actor_radius_is_clamped(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+
+        small = session.spawn_dynamic_actor("vehicle.tesla.model3", geofence_radius=1.0)
+        large = session.spawn_dynamic_actor("vehicle.tesla.model3", geofence_radius=999.0)
+
+        assert small["actor"]["geofence_radius"] == 5.0
+        assert large["actor"]["geofence_radius"] == 250.0
+
+    @pytest.mark.asyncio
+    async def test_despawn_dynamic_actor_disables_autopilot_and_removes_snapshot(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge.drive_server import DriveSession
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+        spawned = session.spawn_dynamic_actor("vehicle.carlamotors.firetruck", geofence_radius=35.0)
+        actor_id = spawned["actor"]["actor_id"]
+        actor = mock_world.get_actor(actor_id)
+
+        result = session.despawn_dynamic_actor(actor_id)
+
+        assert result == {"type": "dynamic_actor_despawned", "actor_id": actor_id, "count": 0}
+        assert actor.autopilot_enabled is False
+        assert actor.is_destroyed is True
+        assert session.get_dynamic_actors_snapshot() == []
+
+    @pytest.mark.asyncio
+    async def test_spawn_dynamic_actor_cleans_up_when_autopilot_fails(self, mock_world, fake_v2x_api, monkeypatch):
+        from digital_twin_bridge.drive_server import DriveSession, _dynamic_actor_ids
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await session.start("2026-03-22T17:00:00Z", "2026-03-22T17:30:00Z")
+
+        original_try_spawn_actor = mock_world.try_spawn_actor
+        spawned_actor = {}
+
+        def spawn_with_broken_autopilot(blueprint, transform, attach_to=None):
+            actor = original_try_spawn_actor(blueprint, transform, attach_to)
+            if getattr(blueprint, "id", "") == "vehicle.carlamotors.firetruck":
+                spawned_actor["actor"] = actor
+
+                def fail_autopilot(enabled, tm_port=None):
+                    raise RuntimeError("traffic manager unavailable")
+
+                actor.set_autopilot = fail_autopilot
+            return actor
+
+        monkeypatch.setattr(mock_world, "try_spawn_actor", spawn_with_broken_autopilot)
+
+        with pytest.raises(RuntimeError, match="traffic manager unavailable"):
+            session.spawn_dynamic_actor("vehicle.carlamotors.firetruck", geofence_radius=35.0)
+
+        actor = spawned_actor["actor"]
+        assert actor.is_destroyed is True
+        assert actor.id not in _dynamic_actor_ids
+        assert session.get_dynamic_actors_snapshot() == []
+
+    @pytest.mark.asyncio
+    async def test_handle_spawn_dynamic_actor_message(self, mock_world, fake_v2x_api):
+        from digital_twin_bridge.drive_server import DriveSession, handle_message
+
+        session = DriveSession(
+            world=mock_world,
+            carla_map=mock_world.get_map(),
+            api_fetcher=fake_v2x_api.get_detections_range,
+        )
+        await handle_message(session, {
+            "type": "start_session",
+            "start": "2026-03-22T17:00:00Z",
+            "end": "2026-03-22T17:30:00Z",
+        })
+
+        response = await handle_message(session, {
+            "type": "spawn_dynamic_actor",
+            "blueprint": "vehicle.carlamotors.firetruck",
+            "geofence_radius": 45,
+            "message": "Firefighter route active",
+        })
+
+        assert response["type"] == "dynamic_actor_spawned"
+        assert response["actor"]["blueprint"] == "vehicle.carlamotors.firetruck"
+        assert response["actor"]["geofence_radius"] == 45.0
+        assert response["actor"]["message"] == "Firefighter route active"

@@ -30,23 +30,31 @@ export const SNAPSHOT_PLACEHOLDER =
 
 // ── Drive Mode Constants ──
 
+const TAILSCALE_DRIVE_WS_URL =
+	import.meta.env.VITE_TAILSCALE_DRIVE_WS_URL ??
+	'wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net';
+
+const CLOUDFLARE_DRIVE_WS_URL =
+	import.meta.env.VITE_CLOUDFLARE_DRIVE_WS_URL ?? import.meta.env.VITE_DRIVE_WS_URL;
+
 export const DRIVE_TUNNELS = [
+	...(CLOUDFLARE_DRIVE_WS_URL
+		? [{
+				id: 'cloudflare' as const,
+				label: 'Cloudflare',
+				url: CLOUDFLARE_DRIVE_WS_URL,
+			}]
+		: []),
 	{
 		id: 'tailscale',
 		label: 'Tailscale',
-		url: 'wss://path-b860i-aorus-pro-ice.tail1cad6a.ts.net',
-	},
-	{
-		id: 'cloudflare',
-		label: 'Cloudflare',
-		url: 'wss://morning-alaska-subaru-chart.trycloudflare.com',
+		url: TAILSCALE_DRIVE_WS_URL,
 	},
 ] as const;
 
 export type TunnelId = (typeof DRIVE_TUNNELS)[number]['id'];
 
-export const DRIVE_WS_URL: string =
-	import.meta.env.VITE_DRIVE_WS_URL ?? DRIVE_TUNNELS[0].url;
+export const DRIVE_WS_URL: string = DRIVE_TUNNELS[0].url;
 
 export const GAMEPAD_DEADZONE = 0.005;
 
@@ -54,7 +62,8 @@ export const GAMEPAD_POLL_RATE = 60;
 
 // Logitech G923 (046d:c266) — 10 axes, 25 buttons
 // Axis 0 = steering, Axis 1 = brake, Axis 2 = gas, Axis 3 = clutch
-// Pedal range varies by OS — auto-detect at runtime
+// Pedals rest at +1.0 and travel toward -1.0 when pressed; hardcoded so input
+// works at spawn without waiting on a sweep-detection window.
 export const DEFAULT_CALIBRATION = {
 	steerAxis: 0,
 	gasAxis: 2,
@@ -62,6 +71,8 @@ export const DEFAULT_CALIBRATION = {
 	steerInverted: false,
 	gasInverted: false,
 	brakeInverted: false,
+	gasRest: 1.0,
+	brakeRest: 1.0,
 };
 
 export const CAMERA_VIEWS = [

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { DRIVE_TUNNELS, type TunnelId } from '$lib/constants';
-	import type { CameraView } from '$lib/types';
+	import type { CameraView, SpawnableObject } from '$lib/types';
 
 	import {
 		gamepadConnected,
@@ -9,6 +9,7 @@
 		normalizedInput,
 		startPolling,
 		stopPolling,
+		applyDefaultRests,
 	} from '$lib/stores/gamepad';
 
 	import {
@@ -29,6 +30,7 @@
 		placedCount,
 		scenarioList,
 		v2xSignalCount,
+		dynamicActors,
 		connect,
 		disconnect,
 		startSession,
@@ -36,6 +38,7 @@
 		switchCamera,
 		endSession,
 		respawnVehicle,
+		clearNonEgoVehicles,
 		requestVehicles,
 		requestObjects,
 		requestScenarios,
@@ -43,6 +46,8 @@
 		loadScenario,
 		deleteScenario,
 		spawnObject,
+		spawnDynamicActor,
+		despawnDynamicActor,
 		undoPlace,
 		undoV2xSignal,
 		setOnFrame,
@@ -59,9 +64,12 @@
 	import TrafficPanel from '$lib/components/TrafficPanel.svelte';
 	import TrajectoryPanel from '$lib/components/TrajectoryPanel.svelte';
 	import CameraSettingsPanel from '$lib/components/CameraSettingsPanel.svelte';
+	import ScenarioPicker from '$lib/components/ScenarioPicker.svelte';
 	import { checkZoneProximity, resetZoneProximity, clearZones } from '$lib/stores/v2xZones';
 	import { v2xZones } from '$lib/stores/v2xZones';
+	import { checkActorGeofenceProximity, resetActorGeofenceProximity } from '$lib/stores/actorGeofences';
 	import { syncV2xZones } from '$lib/stores/driveSocket';
+	import { shouldSyncZone } from '$lib/zoneRules';
 	import { fetchMapDataFull, type MapDataResponse } from '$lib/api';
 
 	type InputMode = 'wheel' | 'keyboard';
@@ -76,6 +84,9 @@
 	let showObjectPlacer = $state(false);
 	let showV2xPlacer = $state(false);
 	let objectFilter = $state('');
+	let actorSpawnMode = $state<'static' | 'autopilot'>('static');
+	let geofenceRadiusM = $state(35);
+	let dynamicActorMessage = $state('Moving emergency vehicle geofence active');
 	let selectedScenario = $state('');
 	let showSaveDialog = $state(false);
 	let scenarioName = $state('');
@@ -84,6 +95,7 @@
 	let showTrafficPanel = $state(false);
 	let showCameraPanel = $state(false);
 	let showTrajectoryPanel = $state(false);
+	let showXoscPicker = $state(false);
 
 	// Split-panel width for the right-side map (px). Persisted in localStorage.
 	const MAP_WIDTH_MIN = 260;
@@ -97,6 +109,18 @@
 	}
 	let mapPanelWidth = $state<number>(loadStoredMapWidth() ?? 500);
 	let dragging = $state(false);
+
+	type MapMode = 'panel' | 'overlay';
+	const MAP_MODE_STORAGE_KEY = 'drive-map-mode';
+	function loadStoredMapMode(): MapMode {
+		if (typeof localStorage === 'undefined') return 'panel';
+		return localStorage.getItem(MAP_MODE_STORAGE_KEY) === 'overlay' ? 'overlay' : 'panel';
+	}
+	let mapMode = $state<MapMode>(loadStoredMapMode());
+	function toggleMapMode() {
+		mapMode = mapMode === 'panel' ? 'overlay' : 'panel';
+		try { localStorage.setItem(MAP_MODE_STORAGE_KEY, mapMode); } catch { /* storage full */ }
+	}
 
 	function clampMapWidth(w: number): number {
 		const max = typeof window !== 'undefined'
@@ -132,6 +156,7 @@
 	let scenarios = $derived($scenarioList);
 	let numPlaced = $derived($placedCount);
 	let numV2xSignals = $derived($v2xSignalCount);
+	let activeDynamicActors = $derived($dynamicActors);
 	let filteredObjects = $derived(
 		objects.filter(o =>
 			objectFilter === '' ||
@@ -172,6 +197,7 @@
 		stopPolling();
 		stopKeyboardInput();
 		setOnFrame(null);
+		resetActorGeofenceProximity();
 		if (state === 'driving' || state === 'ready' || state === 'reconstructing') {
 			endSession();
 		}
@@ -227,6 +253,11 @@
 	});
 
 	function handleQuickStart() {
+		// Wheel without prior calibration: apply G923 defaults so input works
+		// immediately. Wizard remains available via the "Calibrate Wheel" button.
+		if (inputMode === 'wheel' && !isCalibrated) {
+			applyDefaultRests();
+		}
 		const now = new Date();
 		const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
 		startSession(oneHourAgo.toISOString(), now.toISOString(), selectedVehicle);
@@ -257,6 +288,27 @@
 		clearZones();
 	}
 
+	function clampGeofenceRadius(value: number): number {
+		if (!Number.isFinite(value)) return 35;
+		return Math.max(5, Math.min(250, value));
+	}
+
+	function spawnFromActorPanel(obj: SpawnableObject): void {
+		if (actorSpawnMode === 'static') {
+			spawnObject(obj.id);
+			return;
+		}
+
+		if (obj.category !== 'vehicle') {
+			lastError.set('Autopilot mode only supports vehicles. Switch to Static mode to place props.');
+			return;
+		}
+
+		const radius = clampGeofenceRadius(geofenceRadiusM);
+		geofenceRadiusM = radius;
+		spawnDynamicActor(obj.id, radius, dynamicActorMessage.trim());
+	}
+
 	// V2X zone proximity check — runs on every telemetry update during driving
 	$effect(() => {
 		if ($sessionState !== 'driving' || !mapData?.geo_ref) return;
@@ -267,18 +319,33 @@
 		);
 	});
 
+	// Moving actor geofence proximity uses CARLA coordinates and does not need map data.
+	$effect(() => {
+		if ($sessionState !== 'driving') return;
+		const t = $telemetry;
+		checkActorGeofenceProximity(t.pos, $dynamicActors);
+	});
+
 	// Sync V2X zones to bridge for 3D outline rendering (redraw every 5s)
 	let zoneSyncInterval: ReturnType<typeof setInterval> | null = null;
+	function getSyncedZones() {
+		return $v2xZones.filter(shouldSyncZone).map(z => ({
+			polygon: z.polygon,
+			zone_kind: z.zone_kind,
+			signal_type: z.signal_type,
+			color: z.color,
+		}));
+	}
+
 	$effect(() => {
-		if ($sessionState === 'driving' && $v2xZones.length > 0) {
-			const zones = $v2xZones.map(z => ({
-				polygon: z.polygon,
-				signal_type: z.signal_type,
-				color: z.color,
-			}));
+		const zones = getSyncedZones();
+		if ($sessionState === 'driving' && zones.length > 0) {
 			syncV2xZones(zones);
 			if (!zoneSyncInterval) {
-				zoneSyncInterval = setInterval(() => syncV2xZones(zones), 5000);
+				zoneSyncInterval = setInterval(() => {
+					const latestZones = getSyncedZones();
+					if (latestZones.length > 0) syncV2xZones(latestZones);
+				}, 5000);
 			}
 		} else {
 			if (zoneSyncInterval) {
@@ -291,6 +358,7 @@
 	function handleEndSession() {
 		stopControlLoop();
 		resetZoneProximity();
+		resetActorGeofenceProximity();
 		endSession();
 	}
 
@@ -353,6 +421,9 @@
 		if ((e.key === 'u' || e.key === 'U') && !showObjectPlacer && !showV2xPlacer) {
 			undoPlace();
 		}
+		if (e.key === 'x' || e.key === 'X') {
+			showXoscPicker = !showXoscPicker;
+		}
 	}
 </script>
 
@@ -364,6 +435,10 @@
 
 {#if showCalibration}
 	<CalibrationWizard onComplete={handleCalibrationComplete} />
+{/if}
+
+{#if showXoscPicker}
+	<ScenarioPicker onclose={() => { showXoscPicker = false; }} />
 {/if}
 
 <div class="h-screen w-screen bg-black relative overflow-hidden">
@@ -520,7 +595,7 @@
 					</div>
 
 					<!-- V2X Zone Editor button -->
-					<div class="mb-4">
+					<div class="mb-2">
 						<button onclick={() => { showZoneEditor = true; }}
 							class="w-full py-2.5 bg-gray-800/50 hover:bg-gray-800 border border-gray-700 hover:border-cyan-500/50 rounded-xl text-xs font-body tracking-wider text-gray-300 hover:text-cyan-300 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2">
 							<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
@@ -533,19 +608,23 @@
 						</button>
 					</div>
 
+					<!-- OpenSCENARIO Picker button -->
+					<div class="mb-4">
+						<button onclick={() => { showXoscPicker = true; }}
+							class="w-full py-2.5 bg-gray-800/50 hover:bg-gray-800 border border-gray-700 hover:border-purple-500/50 rounded-xl text-xs font-body tracking-wider text-gray-300 hover:text-purple-300 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2">
+							<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+								<path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7-7 7" opacity="0.4" />
+							</svg>
+							OPENSCENARIO (.xosc)
+						</button>
+					</div>
+
 					<!-- Action button -->
-					{#if inputMode === 'wheel' && !isCalibrated}
-						<button onclick={() => showCalibration = true}
-							class="w-full py-3.5 bg-accent hover:bg-red-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.3)] hover:shadow-[0_0_30px_rgba(220,38,38,0.5)] cursor-pointer">
-							Calibrate Wheel
-						</button>
-						<p class="mt-2 text-[10px] font-body text-yellow-500/80 tracking-wider">CALIBRATION REQUIRED BEFORE DRIVING</p>
-					{:else}
-						<button onclick={handleQuickStart}
-							class="w-full py-3.5 bg-accent hover:bg-red-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.3)] hover:shadow-[0_0_30px_rgba(220,38,38,0.5)] cursor-pointer">
-							Start Driving
-						</button>
-					{/if}
+					<button onclick={handleQuickStart}
+						class="w-full py-3.5 bg-accent hover:bg-red-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.3)] hover:shadow-[0_0_30px_rgba(220,38,38,0.5)] cursor-pointer">
+						Start Driving
+					</button>
 
 					<!-- Keyboard shortcuts or wheel status -->
 					<div class="mt-5 pt-4 border-t border-gray-800/60">
@@ -556,7 +635,7 @@
 									['A/D', 'Steer'], ['Space', 'Brake'],
 									['R', 'Respawn'], ['1-4', 'Camera'],
 									['P', 'Place Obj'], ['V', 'V2X Signal'],
-									['U', 'Undo']
+									['U', 'Undo'], ['X', 'Scenarios']
 								] as [key, action]}
 									<div class="flex items-center gap-2">
 										<kbd class="px-1.5 py-0.5 bg-gray-800 border border-gray-700 rounded text-[10px] font-mono text-gray-400 min-w-[28px] text-center">{key}</kbd>
@@ -564,15 +643,10 @@
 									</div>
 								{/each}
 							</div>
-						{:else if gamepad && isCalibrated}
-							<div class="flex items-center justify-center gap-2">
-								<div class="w-2 h-2 bg-green-500 rounded-full shadow-[0_0_6px_rgba(34,197,94,0.5)]"></div>
-								<span class="text-xs font-body text-green-400/80 tracking-wider">WHEEL CALIBRATED — READY</span>
-							</div>
 						{:else if gamepad}
 							<div class="flex items-center justify-center gap-2">
-								<div class="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
-								<span class="text-xs font-body text-yellow-500/80 tracking-wider">CALIBRATE WHEEL TO CONTINUE</span>
+								<div class="w-2 h-2 bg-green-500 rounded-full shadow-[0_0_6px_rgba(34,197,94,0.5)]"></div>
+								<span class="text-xs font-body text-green-400/80 tracking-wider">WHEEL CONNECTED — READY</span>
 							</div>
 						{:else}
 							<div class="flex items-center justify-center gap-2">
@@ -605,67 +679,106 @@
 				<CameraViewComponent bind:this={cameraViewRef} activeView={activeCamera} onSwitchView={handleCameraSwitch} />
 				<HudOverlay telemetry={currentTelemetry} isRecording={true} />
 
+				{#if mapMode === 'overlay' && mapData}
+					<DriveMiniMap
+						roadLines={mapData.road_network}
+						originLat={mapData.geo_ref.origin_lat}
+						originLon={mapData.geo_ref.origin_lon}
+						fullPanel={false}
+					/>
+				{/if}
+
 				<!-- V2X toast notifications -->
 				<V2xToast />
 
-				<!-- Camera + controls overlay on the video -->
-				<div class="absolute top-2 right-2 z-20 flex flex-wrap gap-1 pointer-events-auto">
+				<!-- Camera switcher (top-right) -->
+				<div class="absolute top-4 right-4 z-20 flex items-center gap-0.5 bg-black/40 backdrop-blur-md rounded-xl border border-white/10 p-1 shadow-lg pointer-events-auto">
 					{#each [{ id: 'chase', label: 'Chase' }, { id: 'hood', label: 'Hood' }, { id: 'bird', label: 'Bird' }, { id: 'free', label: 'Free' }] as view}
 						<button onclick={() => handleCameraSwitch(view.id as CameraView)}
-							class="px-2 py-1 rounded text-[10px] font-medium transition-colors {activeCamera === view.id
-								? 'bg-white/25 text-white'
-								: 'bg-black/50 hover:bg-black/70 text-gray-300'}">
+							aria-pressed={activeCamera === view.id}
+							class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {activeCamera === view.id
+								? 'bg-white/15 text-white shadow-sm'
+								: 'text-gray-400 hover:text-white hover:bg-white/5'}">
 							{view.label}
 						</button>
 					{/each}
 				</div>
 
-				<!-- Top left info badges -->
-				<div class="absolute top-2 left-2 z-20 flex items-center gap-1.5 pointer-events-auto">
-					<span class="px-1.5 py-0.5 bg-black/50 rounded text-[10px] text-gray-300">
+				<!-- Status badges (top-left) — hidden in overlay-map mode to avoid collision with the floating mini-map -->
+				<div class="absolute top-4 left-4 z-20 flex items-center gap-2 bg-black/40 backdrop-blur-md rounded-xl border border-white/10 px-3 py-1.5 shadow-lg pointer-events-auto {mapMode === 'overlay' ? 'hidden' : ''}">
+					<span class="w-2 h-2 rounded-full {connected ? 'bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.7)]' : 'bg-red-500'}"></span>
+					<span class="text-xs font-medium text-gray-200 tracking-wide">
 						{inputMode === 'keyboard' ? 'WASD' : 'Wheel'}
 					</span>
 					{#if inputMode === 'wheel' && gamepad}
+						<span class="h-3.5 w-px bg-white/15"></span>
 						<button onclick={() => showCalibration = true}
-							class="px-1.5 py-0.5 bg-black/50 hover:bg-black/70 rounded text-[10px] text-gray-400 hover:text-white transition-colors">
+							class="text-xs text-gray-400 hover:text-white transition-colors cursor-pointer">
 							Cal
 						</button>
 					{/if}
-					<span class="w-1.5 h-1.5 rounded-full {connected ? 'bg-green-500' : 'bg-red-500'}"></span>
 				</div>
 
-				<!-- Bottom left action buttons -->
-				<div class="absolute bottom-2 left-2 z-20 flex gap-1 pointer-events-auto">
+				<!-- Bottom action bar -->
+				<div class="absolute bottom-4 left-4 z-20 flex flex-col items-stretch gap-0.5 bg-black/40 backdrop-blur-md rounded-xl border border-white/10 p-1 shadow-lg pointer-events-auto">
+					<!-- Panel toggles -->
 					<button onclick={() => { showWeatherPanel = !showWeatherPanel; showTrafficPanel = false; showCameraPanel = false; showTrajectoryPanel = false; }}
-						class="px-2 py-1 rounded text-[10px] font-medium transition-colors {showWeatherPanel
-							? 'bg-cyan-600 text-white'
-							: 'bg-black/60 hover:bg-black/80 text-gray-300'}">
+						aria-pressed={showWeatherPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showWeatherPanel
+							? 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Weather
 					</button>
 					<button onclick={() => { showTrafficPanel = !showTrafficPanel; showWeatherPanel = false; showCameraPanel = false; showTrajectoryPanel = false; }}
-						class="px-2 py-1 rounded text-[10px] font-medium transition-colors {showTrafficPanel
-							? 'bg-amber-600 text-white'
-							: 'bg-black/60 hover:bg-black/80 text-gray-300'}">
+						aria-pressed={showTrafficPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showTrafficPanel
+							? 'bg-amber-600 text-white shadow-[0_0_8px_rgba(217,119,6,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Traffic
 					</button>
 					<button onclick={() => { showCameraPanel = !showCameraPanel; showWeatherPanel = false; showTrafficPanel = false; showTrajectoryPanel = false; }}
-						class="px-2 py-1 rounded text-[10px] font-medium transition-colors {showCameraPanel
-							? 'bg-cyan-600 text-white'
-							: 'bg-black/60 hover:bg-black/80 text-gray-300'}">
+						aria-pressed={showCameraPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showCameraPanel
+							? 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Camera
 					</button>
 					<button onclick={() => { showTrajectoryPanel = !showTrajectoryPanel; showWeatherPanel = false; showTrafficPanel = false; showCameraPanel = false; }}
-						class="px-2 py-1 rounded text-[10px] font-medium transition-colors {showTrajectoryPanel
-							? 'bg-blue-600 text-white'
-							: 'bg-black/60 hover:bg-black/80 text-gray-300'}">
+						aria-pressed={showTrajectoryPanel}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showTrajectoryPanel
+							? 'bg-blue-600 text-white shadow-[0_0_8px_rgba(37,99,235,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}">
 						Trajectory
 					</button>
+					<button onclick={() => { showXoscPicker = !showXoscPicker; }}
+						aria-pressed={showXoscPicker}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer {showXoscPicker
+							? 'bg-purple-600 text-white shadow-[0_0_8px_rgba(147,51,234,0.45)]'
+							: 'text-gray-300 hover:text-white hover:bg-white/5'}"
+						title="OpenSCENARIO (X)">
+						Scenarios
+					</button>
+					<button onclick={toggleMapMode}
+						aria-pressed={mapMode === 'overlay'}
+						aria-label={mapMode === 'overlay' ? 'Switch map to full panel' : 'Switch map to floating overlay'}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide transition-all duration-200 cursor-pointer text-gray-300 hover:text-white hover:bg-white/5"
+						title="Toggle map: full panel / floating overlay">
+						Map
+					</button>
+
+					<span class="h-px w-full bg-white/15 my-1.5"></span>
+
+					<button onclick={() => clearNonEgoVehicles()}
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide bg-orange-600/80 hover:bg-orange-600 text-white transition-all duration-200 cursor-pointer"
+						title="Delete all non-ego vehicles (traffic, scenario actors, trajectory playback, placed cars)">
+						Clear NPCs
+					</button>
 					<button onclick={() => respawnVehicle()}
-						class="px-2 py-1 bg-blue-600/70 hover:bg-blue-600 rounded text-[10px] font-medium text-white transition-colors">
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide bg-blue-600/80 hover:bg-blue-600 text-white transition-all duration-200 cursor-pointer">
 						Respawn
 					</button>
 					<button onclick={handleEndSession}
-						class="px-2 py-1 bg-red-600/70 hover:bg-red-600 rounded text-[10px] font-medium text-white transition-colors">
+						class="px-3 py-1.5 rounded-lg text-xs font-medium tracking-wide bg-red-600/80 hover:bg-red-600 text-white transition-all duration-200 cursor-pointer">
 						End
 					</button>
 				</div>
@@ -697,7 +810,7 @@
 			</div>
 
 			<!-- Draggable divider -->
-			{#if mapData}
+			{#if mapData && mapMode === 'panel'}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div
 					class="relative w-1 flex-shrink-0 bg-gray-800 hover:bg-cyan-500/60 {dragging ? 'bg-cyan-500' : ''} cursor-col-resize transition-colors group"
@@ -729,29 +842,74 @@
 
 		<!-- Object Placer Panel — slide-in from bottom-left -->
 		{#if showObjectPlacer}
-			<div class="absolute bottom-16 left-2 z-30 w-72 max-h-80 bg-gray-900/95 border border-gray-700 rounded-xl overflow-hidden pointer-events-auto flex flex-col">
-				<div class="p-2 border-b border-gray-700 flex items-center gap-2">
-					<input
-						type="text"
-						bind:value={objectFilter}
-						placeholder="Search objects..."
-						class="flex-1 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-					/>
-					<button onclick={() => undoPlace()}
-						class="px-2 py-1 bg-yellow-600/70 hover:bg-yellow-600 rounded text-xs text-white"
-						title="Undo last (U)">
-						Undo
-					</button>
-					<button onclick={() => { showObjectPlacer = false; }}
-						class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300">
-						X
-					</button>
+			<div class="absolute bottom-16 left-2 z-30 w-72 max-h-[30rem] bg-gray-900/95 border border-gray-700 rounded-xl overflow-hidden pointer-events-auto flex flex-col">
+				<div class="p-2 border-b border-gray-700 space-y-2">
+					<div class="flex items-center gap-2">
+						<input
+							type="text"
+							bind:value={objectFilter}
+							placeholder="Search objects..."
+							class="flex-1 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+						/>
+						<button onclick={() => undoPlace()}
+							class="px-2 py-1 bg-yellow-600/70 hover:bg-yellow-600 rounded text-xs text-white"
+							title="Undo last (U)">
+							Undo
+						</button>
+						<button onclick={() => { showObjectPlacer = false; }}
+							class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300">
+							X
+						</button>
+					</div>
+
+					<div class="grid grid-cols-2 gap-1 rounded bg-gray-800/70 p-1">
+						<button
+							onclick={() => { actorSpawnMode = 'static'; }}
+							class="px-2 py-1 rounded text-[10px] font-medium transition-colors {actorSpawnMode === 'static'
+								? 'bg-blue-600 text-white'
+								: 'text-gray-400 hover:text-white'}"
+						>
+							Static
+						</button>
+						<button
+							onclick={() => { actorSpawnMode = 'autopilot'; }}
+							class="px-2 py-1 rounded text-[10px] font-medium transition-colors {actorSpawnMode === 'autopilot'
+								? 'bg-red-600 text-white'
+								: 'text-gray-400 hover:text-white'}"
+						>
+							Autopilot
+						</button>
+					</div>
+
+					{#if actorSpawnMode === 'autopilot'}
+						<div class="grid grid-cols-[4.5rem_1fr] gap-1.5">
+							<input
+								type="number"
+								min="5"
+								max="250"
+								step="5"
+								bind:value={geofenceRadiusM}
+								onblur={() => { geofenceRadiusM = clampGeofenceRadius(geofenceRadiusM); }}
+								class="px-2 py-1 bg-gray-800 border border-gray-600 rounded text-xs text-white focus:outline-none focus:border-red-500"
+								title="Geofence radius in meters"
+							/>
+							<input
+								type="text"
+								bind:value={dynamicActorMessage}
+								placeholder="Geofence message..."
+								class="px-2 py-1 bg-gray-800 border border-gray-600 rounded text-xs text-white placeholder-gray-500 focus:outline-none focus:border-red-500"
+							/>
+						</div>
+					{/if}
 				</div>
 				<div class="overflow-y-auto flex-1">
 					{#each filteredObjects as obj}
 						<button
-							onclick={() => { spawnObject(obj.id); }}
-							class="w-full px-3 py-1.5 text-left text-xs hover:bg-gray-800 transition-colors flex items-center gap-2"
+							onclick={() => spawnFromActorPanel(obj)}
+							disabled={actorSpawnMode === 'autopilot' && obj.category !== 'vehicle'}
+							class="w-full px-3 py-1.5 text-left text-xs transition-colors flex items-center gap-2 {actorSpawnMode === 'autopilot' && obj.category !== 'vehicle'
+								? 'opacity-40 cursor-not-allowed'
+								: 'hover:bg-gray-800 cursor-pointer'}"
 						>
 							<span class="w-1.5 h-1.5 rounded-full {obj.category === 'vehicle' ? 'bg-blue-400' : 'bg-orange-400'}"></span>
 							<span class="text-white truncate">{obj.name}</span>
@@ -762,6 +920,27 @@
 						<p class="p-3 text-xs text-gray-500 text-center">
 							{objects.length === 0 ? 'Loading...' : 'No matches'}
 						</p>
+					{/if}
+					{#if activeDynamicActors.length > 0}
+						<div class="border-t border-gray-700 p-2">
+							<p class="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Moving actors</p>
+							<div class="space-y-1">
+								{#each activeDynamicActors as actor (actor.actor_id)}
+									<div class="flex items-center gap-2 rounded bg-gray-800/60 px-2 py-1">
+										<div class="min-w-0 flex-1">
+											<p class="truncate text-xs text-white">{actor.name || actor.blueprint}</p>
+											<p class="text-[10px] text-gray-500">{actor.geofence_radius}m radius</p>
+										</div>
+										<button
+											onclick={() => despawnDynamicActor(actor.actor_id)}
+											class="px-2 py-0.5 rounded bg-red-600/60 hover:bg-red-600 text-[10px] text-white transition-colors"
+										>
+											Remove
+										</button>
+									</div>
+								{/each}
+							</div>
+						</div>
 					{/if}
 				</div>
 				<div class="p-1.5 border-t border-gray-700">

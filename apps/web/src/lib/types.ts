@@ -79,7 +79,23 @@ export interface NearbyActor {
 	id: number;
 	pos: [number, number];
 	yaw: number;
-	type: 'traffic' | 'other';
+	type: 'traffic' | 'dynamic' | 'other';
+}
+
+export interface DynamicActor {
+	actor_id: number;
+	blueprint: string;
+	name: string;
+	pos: [number, number, number];
+	yaw: number;
+	geofence_radius: number;
+	message: string;
+	autopilot: boolean;
+}
+
+export interface ActorGeofenceAlert {
+	actor: DynamicActor;
+	distance: number;
 }
 
 export interface VehicleTelemetry {
@@ -91,6 +107,7 @@ export interface VehicleTelemetry {
 	throttle: number;
 	brake: number;
 	nearby_actors?: NearbyActor[];
+	dynamic_actors?: DynamicActor[];
 }
 
 export type TrafficPreset = 'none' | 'light' | 'medium' | 'heavy' | 'chaos';
@@ -144,10 +161,13 @@ export interface V2xAlert {
 	distance: number;
 }
 
+export type V2xZoneKind = 'warning' | 'geofence';
+
 export interface V2xZone {
 	id: string;
 	name: string;
 	message: string;
+	zone_kind: V2xZoneKind;
 	signal_type: 'warning' | 'info' | 'alert';
 	polygon: [number, number][];
 	color: string;
@@ -170,4 +190,30 @@ export interface TrajectoryStatus {
 	duration?: number;
 	vehicle_id?: number;
 	finished?: boolean;
+}
+
+export interface XoscScenarioInfo {
+	file: string;
+	name: string;
+	size_bytes: number;
+}
+
+export interface XoscRunnerStatus {
+	running: boolean;
+	file?: string | null;
+	started_at?: number | null;
+	exit_code?: number | null;
+	scenario_runner_configured: boolean;
+}
+
+export interface XoscEvent {
+	line: string;
+	ts: number;
+}
+
+export interface XoscFinishedEvent {
+	file: string | null;
+	exit_code: number | null;
+	verdict: 'SUCCESS' | 'FAILURE';
+	duration_sec: number;
 }

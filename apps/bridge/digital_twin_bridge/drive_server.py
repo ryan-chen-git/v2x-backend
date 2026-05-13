@@ -21,6 +21,7 @@ from PIL import Image
 
 from digital_twin_bridge.scene_reconstructor import SceneReconstructor
 from digital_twin_bridge.camera_streamer import compute_camera_transform
+from digital_twin_bridge.openscenario_runner import list_xosc
 from digital_twin_bridge.trajectory_player import (
     TrajectoryPlayer,
     list_trajectory_files,
@@ -45,6 +46,19 @@ TRAFFIC_PRESETS = {
 
 # Module-level traffic tracking so periodic_actor_audit can exclude them
 _traffic_actor_ids: set[int] = set()
+
+# Dynamic actors are individually spawned from the Add Actor panel and carry
+# session-scoped moving geofences.
+_dynamic_actor_ids: set[int] = set()
+
+
+@dataclass
+class DynamicActorMeta:
+    actor_id: int
+    blueprint: str
+    name: str
+    geofence_radius: float
+    message: str
 
 
 def get_available_vehicles(world) -> list[dict]:
@@ -105,6 +119,15 @@ def get_spawnable_objects(world) -> list[dict]:
     # Sort by category then name
     objects.sort(key=lambda o: (0 if o["category"] == "vehicle" else 1, o["name"]))
     return objects
+
+
+def display_name_from_blueprint(blueprint_id: str) -> str:
+    parts = blueprint_id.split(".")
+    if len(parts) >= 3:
+        make = parts[1].title()
+        model = parts[2].replace("_", " ").title()
+        return f"{make} {model}"
+    return blueprint_id
 
 
 # ── Scenario file I/O ──
@@ -221,16 +244,38 @@ class DriveSession:
         api_fetcher: Callable,
         shared_prop_pool: Optional[dict] = None,
         trajectory_player: Optional[TrajectoryPlayer] = None,
+        openscenario_runner=None,
+        eva_warning_distance_m: float = 20.0,
     ):
         self._world = world
         self._map = carla_map
         self._api_fetcher = api_fetcher
+        # Emergency-vehicle pull-over warning: every tick, broadcast a
+        # v2x_alert for each firetruck within this radius. Browser dedups by
+        # actor id (single toast per truck, distance updates in place) and
+        # auto-dismisses when alerts stop arriving.
+        self._eva_warning_distance_m = eva_warning_distance_m
+        # Per-firetruck timestamps of when the ego entered the truck's forward
+        # path. Used to debounce the "please yield" alert: it only fires after
+        # the ego has been blocking the truck for >10s. Cleared as soon as the
+        # ego leaves the truck's forward cone.
+        self._in_front_since: dict[int, float] = {}
+        # Per-session unique ego role_name. ScenarioRunner attaches to the ego
+        # via its role_name; with multiple browsers sharing a CARLA world, a
+        # global "ego_vehicle" tag would let SR pick whichever ego it found
+        # first instead of the one belonging to the session that clicked Start.
+        # Each session stamps its own ego with a unique role and the runner
+        # rewrites the .xosc on launch to reference that exact role.
+        self._ego_role = f"ego_vehicle_{id(self):x}"
         # Shared V2X prop pool across sessions (object_id -> actor_id). Owned by
         # the server process, not the session. None → session-owned props (legacy).
         self._shared_prop_pool = shared_prop_pool
         # Server-owned trajectory player; one playback shared across all sessions
         # in the world. None → trajectory feature disabled.
         self._trajectory_player = trajectory_player
+        # Server-owned OpenSCENARIO runner; one scenario runs at a time across
+        # all sessions. None → feature disabled.
+        self._openscenario_runner = openscenario_runner
         self._reconstructor: Optional[SceneReconstructor] = None
         self.vehicle = None
         self.active_camera: str = "chase"
@@ -240,11 +285,20 @@ class DriveSession:
         self._frame_lock = threading.Lock()
         self._accepting_frames = False  # Guard against callbacks after stop
         self._placed_objects: list = []  # User-placed objects (actor, blueprint_id, pos)
+        self._dynamic_actors: dict[int, DynamicActorMeta] = {}
         # Camera stream config — survives set_camera_settings respawns.
         # Default to 1:1 square to match the drive UI's split layout.
         self._camera_width = 720
         self._camera_height = 720
         self._camera_fov = 90.0
+        # Custom post-processing attrs persisted across set_camera_settings respawns.
+        self._camera_extra_attrs: dict[str, str] = {}
+        # Vehicle bounding-box half-extents, populated after spawn. Camera
+        # transforms scale by these so they fit any vehicle (matches the
+        # bound_x/y/z idiom in CARLA's manual_control.py).
+        self._bound_x = 2.5
+        self._bound_y = 1.0
+        self._bound_z = 0.8
 
     async def start(self, start: str, end: str, vehicle_blueprint: str = DEFAULT_VEHICLE) -> dict:
         """Start a driving session: reconstruct scene, spawn vehicle, attach camera.
@@ -272,6 +326,13 @@ class DriveSession:
             if not vehicle_bps:
                 raise RuntimeError("Vehicle blueprint not found")
 
+            # Tag the ego so ScenarioRunner attaches to it by role_name
+            # instead of trying to spawn a duplicate from the .xosc. The role
+            # is per-session (see self._ego_role) so SR picks this session's
+            # ego specifically when other drivers are sharing the world.
+            ego_bp = vehicle_bps[0]
+            ego_bp.set_attribute("role_name", self._ego_role)
+
             import random
             spawn_points = self._map.get_spawn_points()
             if not spawn_points:
@@ -280,13 +341,43 @@ class DriveSession:
             random.shuffle(spawn_points)
             self.vehicle = None
             for sp in spawn_points:
-                self.vehicle = self._world.try_spawn_actor(vehicle_bps[0], sp)
+                self.vehicle = self._world.try_spawn_actor(ego_bp, sp)
                 if self.vehicle is not None:
                     break
             if self.vehicle is None:
                 raise RuntimeError("Failed to spawn vehicle")
 
             # Physics power cap removed — vehicle runs at stock max_rpm / torque curve.
+
+            # Stable wheel-ground contact at speed. CARLA's default raycast
+            # wheels can momentarily lose contact during fast cornering,
+            # which feels like the car "gliding" or losing grip. Sweep
+            # collision (used in CARLA's own manual_control.py example)
+            # tracks the wheel volume across each frame so it can't skip
+            # over the road. Pair with a modest tire-friction bump above
+            # the Tesla Model 3's stock 3.5 — the stock Tesla is on the
+            # slipperier end of CARLA's catalog and the ±0.7 steering cap
+            # alone wasn't quite enough to keep it planted at speed.
+            try:
+                physics = self.vehicle.get_physics_control()
+                physics.use_sweep_wheel_collision = True
+                wheels = physics.wheels
+                for wh in wheels:
+                    wh.tire_friction = 4.5
+                physics.wheels = wheels
+                self.vehicle.apply_physics_control(physics)
+            except Exception as e:
+                logger.warning("Failed to apply ego physics tweaks: %s", e)
+
+            # Cache vehicle half-extents so camera transforms scale to the
+            # actual model (matches manual_control.py's bound_x/y/z idiom).
+            try:
+                bb = self.vehicle.bounding_box.extent
+                self._bound_x = 0.5 + bb.x
+                self._bound_y = 0.5 + bb.y
+                self._bound_z = 0.5 + bb.z
+            except Exception:
+                self._bound_x, self._bound_y, self._bound_z = 2.5, 1.0, 0.8
 
             # Attach RGB camera sensor to the vehicle
             self._attach_camera(bp_lib)
@@ -310,6 +401,47 @@ class DriveSession:
             self._force_cleanup()
             raise
 
+    @staticmethod
+    def _attachment_for_view(view: str):
+        """SpringArmGhost auto-orients the camera toward the parent and
+        smoothly lags during rotation — great for external chase-style
+        views, terrible for cockpit/hood (would face backward at the
+        parent) or bird (spring can't reasonably extend 25 m straight up).
+        Match manual_control.py: Rigid for cockpit, SpringArmGhost for
+        external follow cameras.
+        """
+        import carla
+        if view in ("hood", "bird"):
+            return carla.AttachmentType.Rigid
+        return carla.AttachmentType.SpringArmGhost
+
+    def _transform_for_view(self, view: str):
+        """Camera transforms scaled by the vehicle's bounding box, copied
+        from manual_control.py's `_camera_transforms` list (lines 1080-85).
+        """
+        import carla
+        bx, by, bz = self._bound_x, self._bound_y, self._bound_z
+        if view == "hood":
+            # manual_control index 1: dashboard / front-bumper view
+            return carla.Transform(carla.Location(x=+0.8 * bx, y=0.0, z=1.3 * bz))
+        if view == "free":
+            # manual_control index 3: high-back chase, slightly tilted
+            return carla.Transform(
+                carla.Location(x=-2.8 * bx, y=0.0, z=4.6 * bz),
+                carla.Rotation(pitch=6.0),
+            )
+        if view == "bird":
+            # No equivalent in manual_control — true top-down for the map view
+            return carla.Transform(carla.Location(x=0.0, z=25.0), carla.Rotation(pitch=-90.0))
+        # chase (default): manual_control index 0, with z slightly raised
+        # because the SpringArmGhost settled position lags below the
+        # configured offset, so the configured z has to be a touch above
+        # the desired *settled* height.
+        return carla.Transform(
+            carla.Location(x=-2.0 * bx, y=0.0, z=2.4 * bz),
+            carla.Rotation(pitch=8.0),
+        )
+
     def _attach_camera(self, bp_lib):
         """Attach an RGB camera sensor to the vehicle for streaming frames."""
         try:
@@ -325,14 +457,14 @@ class DriveSession:
             camera_bp.set_attribute("fov", str(self._camera_fov))
             camera_bp.set_attribute("sensor_tick", "0.05")  # 20 FPS
 
-            # Initial transform: chase camera
-            cam_transform = carla.Transform(
-                carla.Location(x=-8.0, z=4.0),
-                carla.Rotation(pitch=-15.0),
-            )
+            # Initial transform: chase camera, scaled to vehicle bounds
+            # exactly the way manual_control.py does it (index 0 of its
+            # _camera_transforms list).
+            cam_transform = self._transform_for_view(self.active_camera)
 
             self._camera_sensor = self._world.spawn_actor(
-                camera_bp, cam_transform, attach_to=self.vehicle
+                camera_bp, cam_transform, attach_to=self.vehicle,
+                attachment_type=self._attachment_for_view(self.active_camera),
             )
             self._camera_sensor.listen(self._on_camera_frame)
             logger.info("Camera sensor attached (%dx%d @ 20fps)", self._camera_width, self._camera_height)
@@ -376,34 +508,22 @@ class DriveSession:
         # same as PythonAPI/examples/manual_control.py.
         capped_throttle = max(0.0, min(1.0, throttle))
 
-        try:
-            import carla
-            control = carla.VehicleControl(
-                steer=max(-1.0, min(1.0, steer)),
-                throttle=capped_throttle,
-                brake=max(0.0, min(1.0, brake)),
-                reverse=reverse,
-            )
-        except ImportError:
-            from tests.conftest import MockVehicleControl
-            control = MockVehicleControl(
-                steer=max(-1.0, min(1.0, steer)),
-                throttle=capped_throttle,
-                brake=max(0.0, min(1.0, brake)),
-                reverse=reverse,
-            )
+        import carla
+        control = carla.VehicleControl(
+            steer=max(-1.0, min(1.0, steer)),
+            throttle=capped_throttle,
+            brake=max(0.0, min(1.0, brake)),
+            reverse=reverse,
+        )
 
         self.vehicle.apply_control(control)
-
-        # Update camera position based on active view
-        self._update_camera_transform()
 
         transform = self.vehicle.get_transform()
         velocity = self.vehicle.get_velocity()
         speed_ms = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         speed_kmh = speed_ms * 3.6
 
-        return {
+        telemetry = {
             "type": "telemetry",
             "speed": round(speed_kmh, 1),
             "gear": getattr(self.vehicle.get_control(), "gear", 0),
@@ -421,24 +541,61 @@ class DriveSession:
             "throttle": round(throttle, 3),
             "brake": round(brake, 3),
             "nearby_actors": self.get_nearby_actors(),
+            "dynamic_actors": self.get_dynamic_actors_snapshot(),
         }
+        eva_alerts = self._check_emergency_vehicle_proximity()
+        yield_alerts = self._check_yield_to_firetruck()
+        all_alerts = eva_alerts + yield_alerts
+        if all_alerts:
+            telemetry["v2x_alerts"] = all_alerts
+        return telemetry
 
     def _update_camera_transform(self):
-        """Move the camera sensor to match the active view."""
+        """Switch to the active view by respawning the camera sensor.
+
+        We don't use `set_transform` here because the camera is attached
+        with `SpringArmGhost`, which has an internal arm-length that
+        evolves over time from the parent toward the desired offset.
+        Calling `set_transform` snaps the spring to the full configured
+        offset (the rigid desired position), bypassing the natural
+        settling animation. Respawning gives every view-switch the same
+        fresh spring extension behavior the initial spawn has.
+        """
         if self._camera_sensor is None or self.vehicle is None:
             return
         try:
             import carla
-            configs = {
-                "chase": carla.Transform(carla.Location(x=-8.0, z=4.0), carla.Rotation(pitch=-15.0)),
-                "hood": carla.Transform(carla.Location(x=0.5, z=1.5), carla.Rotation(pitch=0.0)),
-                "bird": carla.Transform(carla.Location(x=0.0, z=25.0), carla.Rotation(pitch=-90.0)),
-                "free": carla.Transform(carla.Location(x=-5.0, z=3.0), carla.Rotation(pitch=-10.0)),
-            }
-            new_transform = configs.get(self.active_camera, configs["chase"])
-            self._camera_sensor.set_transform(new_transform)
-        except Exception:
-            pass
+            self._accepting_frames = False
+            try:
+                self._camera_sensor.stop()
+            except Exception:
+                pass
+            try:
+                self._camera_sensor.destroy()
+            except Exception:
+                pass
+
+            bp_lib = self._world.get_blueprint_library()
+            camera_bp = bp_lib.find("sensor.camera.rgb")
+            camera_bp.set_attribute("image_size_x", str(self._camera_width))
+            camera_bp.set_attribute("image_size_y", str(self._camera_height))
+            camera_bp.set_attribute("fov", str(self._camera_fov))
+            camera_bp.set_attribute("sensor_tick", "0.05")
+            for key, value in self._camera_extra_attrs.items():
+                try:
+                    camera_bp.set_attribute(key, str(value))
+                except Exception:
+                    pass
+
+            new_transform = self._transform_for_view(self.active_camera)
+            self._camera_sensor = self._world.spawn_actor(
+                camera_bp, new_transform, attach_to=self.vehicle,
+                attachment_type=self._attachment_for_view(self.active_camera),
+            )
+            self._camera_sensor.listen(self._on_camera_frame)
+            self._accepting_frames = True
+        except Exception as e:
+            logger.warning("Camera respawn for view switch failed: %s", e)
 
     def respawn(self) -> dict:
         """Teleport the vehicle to a random spawn point on the road."""
@@ -658,15 +815,18 @@ class DriveSession:
         camera_bp.set_attribute("fov", str(self._camera_fov))
         camera_bp.set_attribute("sensor_tick", "0.05")
 
-        # Apply remaining post-processing settings
+        # Apply remaining post-processing settings, persisting them so
+        # later view-switch respawns don't reset the user's tweaks.
         for key, value in params.items():
             try:
                 camera_bp.set_attribute(key, str(value))
+                self._camera_extra_attrs[key] = str(value)
             except Exception as e:
                 logger.debug("Camera attribute '%s' failed: %s", key, e)
 
         self._camera_sensor = self._world.spawn_actor(
-            camera_bp, current_transform, attach_to=self.vehicle
+            camera_bp, current_transform, attach_to=self.vehicle,
+            attachment_type=self._attachment_for_view(self.active_camera),
         )
         self._camera_sensor.listen(self._on_camera_frame)
         self._accepting_frames = True
@@ -682,6 +842,188 @@ class DriveSession:
             "fov": self._camera_fov,
         }
 
+    def _get_traffic_manager(self):
+        """Return a CARLA Traffic Manager and its port."""
+        import carla
+        from digital_twin_bridge.config import Config
+
+        config = Config.from_env()
+        client = carla.Client(config.CARLA_HOST, config.CARLA_PORT)
+
+        client.set_timeout(10.0)
+        tm = client.get_trafficmanager()
+        tm.set_synchronous_mode(True)
+        return tm, tm.get_port()
+
+    def _build_transform(self, location, rotation):
+        import carla
+        return carla.Transform(location, rotation)
+
+    def spawn_dynamic_actor(
+        self,
+        blueprint_id: str,
+        geofence_radius: float = 35.0,
+        message: str = "",
+    ) -> dict:
+        """Spawn one selected vehicle as an autopilot actor with a moving geofence."""
+        if not self._active or self.vehicle is None:
+            raise RuntimeError("No active session")
+        if not blueprint_id.startswith("vehicle."):
+            raise ValueError("Dynamic actors must use vehicle blueprints")
+
+        import random
+
+        bp_lib = self._world.get_blueprint_library()
+        bp = bp_lib.find(blueprint_id)
+        if bp is None:
+            raise ValueError(f"Blueprint not found: {blueprint_id}")
+
+        if bp.has_attribute("number_of_wheels"):
+            wheels_attr = bp.get_attribute("number_of_wheels")
+            wheels_values = getattr(wheels_attr, "recommended_values", None)
+            wheels_value = wheels_values[0] if wheels_values else str(wheels_attr)
+            if int(wheels_value) != 4:
+                raise ValueError("Dynamic actors must be four-wheeled vehicles")
+
+        radius = max(5.0, min(250.0, float(geofence_radius)))
+        actor_name = display_name_from_blueprint(blueprint_id)
+        actor_message = str(message).strip() or f"{actor_name} geofence active"
+
+        tm, tm_port = self._get_traffic_manager()
+
+        if bp.has_attribute("color"):
+            colors = bp.get_attribute("color").recommended_values
+            if colors:
+                bp.set_attribute("color", random.choice(colors))
+        bp.set_attribute("role_name", "dynamic_geofence")
+
+        spawn_points = self._filter_spawn_points_near_placed(self._map.get_spawn_points(), radius=12.0)
+        random.shuffle(spawn_points)
+        if not spawn_points:
+            raise RuntimeError("No safe spawn points available for dynamic actor")
+
+        actor = None
+        for spawn_point in spawn_points:
+            actor = self._world.try_spawn_actor(bp, spawn_point)
+            if actor is not None:
+                break
+        if actor is None:
+            raise RuntimeError(f"Failed to spawn {blueprint_id} for autopilot")
+
+        try:
+            actor.set_autopilot(True, tm_port)
+        except Exception:
+            try:
+                actor.destroy()
+            except Exception as e:
+                logger.warning("Failed to destroy dynamic actor after autopilot setup failed: %s", e)
+            raise
+
+        try:
+            tm.ignore_lights_percentage(actor, 0.0)
+            tm.ignore_signs_percentage(actor, 0.0)
+        except Exception:
+            pass
+
+        meta = DynamicActorMeta(
+            actor_id=actor.id,
+            blueprint=blueprint_id,
+            name=actor_name,
+            geofence_radius=radius,
+            message=actor_message,
+        )
+        self._dynamic_actors[actor.id] = meta
+        _dynamic_actor_ids.add(actor.id)
+
+        logger.info(
+            "Spawned dynamic actor %s (id=%d) geofence=%.1fm",
+            blueprint_id,
+            actor.id,
+            radius,
+        )
+
+        return {
+            "type": "dynamic_actor_spawned",
+            "actor": self._serialize_dynamic_actor(actor, meta),
+            "count": len(self._dynamic_actors),
+        }
+
+    def _serialize_dynamic_actor(self, actor, meta: DynamicActorMeta) -> dict:
+        transform = actor.get_transform()
+        return {
+            "actor_id": meta.actor_id,
+            "blueprint": meta.blueprint,
+            "name": meta.name,
+            "pos": [
+                round(transform.location.x, 2),
+                round(transform.location.y, 2),
+                round(transform.location.z, 2),
+            ],
+            "yaw": round(transform.rotation.yaw, 1),
+            "geofence_radius": meta.geofence_radius,
+            "message": meta.message,
+            "autopilot": True,
+        }
+
+    def get_dynamic_actors_snapshot(self) -> list[dict]:
+        """Return live dynamic actor positions and prune actors no longer in the world."""
+        snapshot: list[dict] = []
+        stale_ids: list[int] = []
+
+        for actor_id, meta in self._dynamic_actors.items():
+            actor = self._world.get_actor(actor_id)
+            if actor is None or getattr(actor, "is_destroyed", False):
+                stale_ids.append(actor_id)
+                continue
+            snapshot.append(self._serialize_dynamic_actor(actor, meta))
+
+        for actor_id in stale_ids:
+            self._dynamic_actors.pop(actor_id, None)
+            _dynamic_actor_ids.discard(actor_id)
+
+        return snapshot
+
+    def _destroy_dynamic_actor(self, actor_id: int) -> bool:
+        actor = self._world.get_actor(actor_id)
+        destroyed = False
+        if actor is not None:
+            try:
+                actor.set_autopilot(False)
+            except Exception:
+                pass
+            try:
+                actor.destroy()
+                destroyed = True
+            except Exception as e:
+                logger.debug("Failed to destroy dynamic actor %d: %s", actor_id, e)
+
+        self._dynamic_actors.pop(actor_id, None)
+        _dynamic_actor_ids.discard(actor_id)
+        return destroyed
+
+    def despawn_dynamic_actor(self, actor_id: int) -> dict:
+        """Remove one Add Actor autopilot vehicle."""
+        if not self._active:
+            raise RuntimeError("No active session")
+
+        actor_id = int(actor_id)
+        if actor_id not in self._dynamic_actors:
+            return {"type": "dynamic_actor_missing", "actor_id": actor_id, "count": len(self._dynamic_actors)}
+
+        self._destroy_dynamic_actor(actor_id)
+        return {"type": "dynamic_actor_despawned", "actor_id": actor_id, "count": len(self._dynamic_actors)}
+
+    def despawn_dynamic_actors(self) -> dict:
+        """Remove all Add Actor autopilot vehicles."""
+        if not self._active:
+            raise RuntimeError("No active session")
+
+        count = 0
+        for actor_id in list(self._dynamic_actors):
+            if self._destroy_dynamic_actor(actor_id):
+                count += 1
+        return {"type": "dynamic_actors_despawned", "count": count}
+
     def spawn_traffic(self, preset: str = "medium") -> dict:
         """Spawn autonomous NPC vehicles using CARLA's Traffic Manager.
 
@@ -690,7 +1032,6 @@ class DriveSession:
         if not self._active:
             raise RuntimeError("No active session")
 
-        import carla
         import random
 
         # Clean up existing traffic first
@@ -702,17 +1043,10 @@ class DriveSession:
         if target_count == 0:
             return {"type": "traffic_spawned", "preset": preset, "count": 0}
 
-        client = carla.Client(
-            self._world.get_settings().synchronous_mode and "localhost" or "localhost",
-            2000,
-        )
-        client.set_timeout(10.0)
-        tm = client.get_trafficmanager()
-        tm_port = tm.get_port()
+        tm, tm_port = self._get_traffic_manager()
 
         tm.global_percentage_speed_difference(config["speed_diff"])
         tm.set_global_distance_to_leading_vehicle(config["distance"])
-        tm.set_synchronous_mode(True)
 
         bp_lib = self._world.get_blueprint_library()
         vehicle_bps = [bp for bp in bp_lib.filter("vehicle.*")
@@ -759,9 +1093,10 @@ class DriveSession:
         """Return spawn points not within ``radius`` of any protected actor.
 
         Protected actors: the player vehicle, every entry in
-        ``_placed_objects`` (user spawns + scenario loads), and the
-        trajectory player's car if it's active. Used by ``spawn_traffic``
-        to keep autopilot NPCs from spawning on top of placements.
+        ``_placed_objects`` (user spawns + scenario loads), dynamic
+        Add Actor vehicles, and the trajectory player's car if it's active.
+        Used by ``spawn_traffic`` and dynamic actor spawning to keep
+        autopilot vehicles from spawning on top of protected actors.
         """
         blocked: list[tuple[float, float]] = []
 
@@ -786,6 +1121,16 @@ class DriveSession:
             if pos and len(pos) >= 2:
                 blocked.append((float(pos[0]), float(pos[1])))
 
+        for actor_id in self._dynamic_actors:
+            actor = self._world.get_actor(actor_id)
+            if actor is None or getattr(actor, "is_destroyed", False):
+                continue
+            try:
+                loc = actor.get_transform().location
+                blocked.append((loc.x, loc.y))
+            except Exception:
+                pass
+
         tp = self._trajectory_player
         if tp is not None and tp.is_active() and tp.vehicle is not None:
             try:
@@ -805,6 +1150,52 @@ class DriveSession:
                 continue
             safe.append(sp)
         return safe
+
+    def clear_non_ego_vehicles(self) -> dict:
+        """Destroy every vehicle in the world that isn't tagged as ego.
+
+        Preserves any actor whose role_name starts with ``"ego_vehicle"`` so
+        every drive session keeps its car (each session stamps its ego with a
+        per-session unique suffix; see ``self._ego_role``). Wipes traffic
+        NPCs, OpenSCENARIO actors, the trajectory playback car, and any
+        user-placed vehicles.
+        """
+        if not self._active:
+            raise RuntimeError("No active session")
+
+        destroyed_ids: set[int] = set()
+        preserved = 0
+        for actor in self._world.get_actors().filter("vehicle.*"):
+            role = actor.attributes.get("role_name", "") if actor.attributes else ""
+            if role.startswith("ego_vehicle"):
+                preserved += 1
+                continue
+            try:
+                actor.set_autopilot(False)
+            except Exception:
+                pass
+            try:
+                actor.destroy()
+                destroyed_ids.add(actor.id)
+            except Exception as e:
+                logger.debug("Failed to destroy actor %d: %s", actor.id, e)
+
+        _traffic_actor_ids.difference_update(destroyed_ids)
+        self._placed_objects = [
+            o for o in self._placed_objects
+            if o.get("actor") is not None and o["actor"].id not in destroyed_ids
+        ]
+
+        logger.info(
+            "Cleared %d non-ego vehicles (preserved %d ego)",
+            len(destroyed_ids), preserved,
+        )
+        return {
+            "type": "non_ego_vehicles_cleared",
+            "destroyed": len(destroyed_ids),
+            "preserved": preserved,
+            "placed_count": len(self._placed_objects),
+        }
 
     def despawn_traffic(self) -> dict:
         """Remove all traffic vehicles spawned by spawn_traffic."""
@@ -829,6 +1220,118 @@ class DriveSession:
         logger.info("Despawned %d traffic vehicles", destroyed)
         return {"type": "traffic_despawned", "count": destroyed}
 
+    def _check_emergency_vehicle_proximity(self) -> list[dict]:
+        """Return a v2x_alert for every firetruck approaching from behind the ego, every tick.
+
+        Only firetrucks behind the ego (negative projection on the ego's
+        forward axis) qualify — there's no point telling the driver to pull
+        over for a truck they've already passed.
+
+        The browser dedups by ``id``: the first message creates a toast, every
+        subsequent message updates the same toast's distance in place. The
+        toast auto-dismisses when no message arrives for the actor (i.e. it
+        left range or was destroyed). No backend-side debouncing — keeping
+        emission stateless avoids the prior "velocity dot oscillates around
+        zero → repeated re-alerts" bug.
+        """
+        if self.vehicle is None or self._world is None:
+            return []
+
+        player_transform = self.vehicle.get_transform()
+        player_loc = player_transform.location
+        forward = player_transform.get_forward_vector()
+        threshold_sq = self._eva_warning_distance_m * self._eva_warning_distance_m
+        alerts: list[dict] = []
+
+        for actor in self._world.get_actors().filter("vehicle.carlamotors.firetruck"):
+            if actor.id == self.vehicle.id:
+                continue
+            loc = actor.get_transform().location
+            dx = loc.x - player_loc.x
+            dy = loc.y - player_loc.y
+            dist_sq = dx * dx + dy * dy
+            if dist_sq > threshold_sq:
+                continue
+            # Project ego→truck displacement onto the ego's forward axis.
+            # Negative means the truck is behind the ego.
+            if forward.x * dx + forward.y * dy >= 0:
+                continue
+            alerts.append({
+                "id": actor.id,
+                "message": "Firetruck approaching from behind",
+                "signal_type": "warning",
+                "distance": round(math.sqrt(dist_sq), 1),
+            })
+
+        return alerts
+
+    def _check_yield_to_firetruck(self) -> list[dict]:
+        """Return a v2x_alert when the ego has been blocking a firetruck for >10s.
+
+        "Blocking" is from the truck's perspective: the ego sits ahead along
+        the truck's forward axis, within ``eva_warning_distance_m`` meters,
+        and within ~4 m of its centerline (about a lane width). The 10-second
+        debounce avoids triggering on transient passes (oncoming lanes,
+        crossing intersections at speed) — only sustained obstruction trips
+        the alert.
+
+        Independent of ``_check_emergency_vehicle_proximity``: that one keys
+        off the ego's heading (truck is behind ego) while this one keys off
+        the truck's heading. Both can fire at once when the ego is stopped
+        in the truck's path. Alert ``id`` is offset by 1_000_000 so the
+        browser keeps the two toasts as separate entries.
+        """
+        if self.vehicle is None or self._world is None:
+            return []
+
+        now = time.monotonic()
+        ego_loc = self.vehicle.get_transform().location
+        threshold = self._eva_warning_distance_m
+        threshold_sq = threshold * threshold
+        alerts: list[dict] = []
+        seen_truck_ids: set[int] = set()
+
+        for actor in self._world.get_actors().filter("vehicle.carlamotors.firetruck"):
+            if actor.id == self.vehicle.id:
+                continue
+            t = actor.get_transform()
+            truck_loc = t.location
+            dx = ego_loc.x - truck_loc.x
+            dy = ego_loc.y - truck_loc.y
+            dist_sq = dx * dx + dy * dy
+            if dist_sq > threshold_sq:
+                continue
+            forward = t.get_forward_vector()
+            right = t.get_right_vector()
+            forward_dist = forward.x * dx + forward.y * dy
+            lateral = abs(right.x * dx + right.y * dy)
+            if forward_dist <= 0 or lateral > 4.0:
+                continue
+
+            seen_truck_ids.add(actor.id)
+            since = self._in_front_since.get(actor.id)
+            if since is None:
+                self._in_front_since[actor.id] = now
+                continue
+            if now - since < 10.0:
+                continue
+
+            alerts.append({
+                "id": actor.id + 1_000_000,
+                "message": "Yield to clear firetruck path",
+                "signal_type": "warning",
+                "distance": round(math.sqrt(dist_sq), 1),
+            })
+
+        # Reset the timer for trucks no longer in the cone (drove past, swerved
+        # away, destroyed). Without this, a brief gap and re-entry would skip
+        # the 10s wait.
+        for tid in list(self._in_front_since):
+            if tid not in seen_truck_ids:
+                del self._in_front_since[tid]
+
+        return alerts
+
     def get_nearby_actors(self, radius: float = 250.0) -> list[dict]:
         """Return all vehicles within radius meters of the player vehicle.
 
@@ -852,7 +1355,11 @@ class DriveSession:
                 "id": a.id,
                 "pos": [round(t.location.x, 2), round(t.location.y, 2)],
                 "yaw": round(t.rotation.yaw, 1),
-                "type": "traffic" if a.id in _traffic_actor_ids else "other",
+                "type": (
+                    "dynamic" if a.id in _dynamic_actor_ids
+                    else "traffic" if a.id in _traffic_actor_ids
+                    else "other"
+                ),
             })
 
         return actors
@@ -1068,6 +1575,11 @@ class DriveSession:
                 logger.warning("Vehicle destroy failed: %s", e)
             self.vehicle = None
 
+        # Dynamic Add Actor autopilot vehicles
+        for actor_id in list(self._dynamic_actors):
+            self._destroy_dynamic_actor(actor_id)
+        self._dynamic_actors.clear()
+
         # User-placed objects
         for entry in self._placed_objects:
             try:
@@ -1107,6 +1619,16 @@ async def handle_message(session: DriveSession, msg: dict) -> dict:
                 blueprint_id=msg["blueprint"],
                 forward_offset=float(msg.get("offset", 8.0)),
             )
+        elif msg_type == "spawn_dynamic_actor":
+            return session.spawn_dynamic_actor(
+                blueprint_id=msg["blueprint"],
+                geofence_radius=float(msg.get("geofence_radius", 35.0)),
+                message=str(msg.get("message", "")),
+            )
+        elif msg_type == "despawn_dynamic_actor":
+            return session.despawn_dynamic_actor(int(msg["actor_id"]))
+        elif msg_type == "despawn_dynamic_actors":
+            return session.despawn_dynamic_actors()
         elif msg_type == "undo_place":
             return session.undo_place()
         elif msg_type == "list_scenarios":
@@ -1139,6 +1661,22 @@ async def handle_message(session: DriveSession, msg: dict) -> dict:
             return result
         elif msg_type == "delete_scenario":
             return delete_scenario(msg["file"])
+        elif msg_type == "list_xosc_scenarios":
+            runner = session._openscenario_runner
+            status = runner.status() if runner is not None else {
+                "running": False, "scenario_runner_configured": False,
+            }
+            return {"type": "xosc_list", "scenarios": list_xosc(), "status": status}
+        elif msg_type == "start_xosc_scenario":
+            if session._openscenario_runner is None:
+                return {"type": "error", "message": "OpenSCENARIO runner unavailable"}
+            if not msg.get("file"):
+                return {"type": "error", "message": "start_xosc_scenario requires 'file'"}
+            return session._openscenario_runner.start(msg["file"], ego_role=session._ego_role)
+        elif msg_type == "stop_xosc_scenario":
+            if session._openscenario_runner is None:
+                return {"type": "error", "message": "OpenSCENARIO runner unavailable"}
+            return session._openscenario_runner.stop()
         elif msg_type == "start_session":
             vehicle_bp = msg.get("vehicle", DEFAULT_VEHICLE)
             return await session.start(
@@ -1164,6 +1702,8 @@ async def handle_message(session: DriveSession, msg: dict) -> dict:
             return session.spawn_traffic(msg.get("preset", "medium"))
         elif msg_type == "despawn_traffic":
             return session.despawn_traffic()
+        elif msg_type == "clear_non_ego_vehicles":
+            return session.clear_non_ego_vehicles()
         elif msg_type == "sync_v2x_zones":
             return session.sync_v2x_zones(msg.get("zones", []))
         elif msg_type == "respawn":
@@ -1222,6 +1762,8 @@ async def serve_drive(
     api_fetcher,
     shared_prop_pool: Optional[dict] = None,
     trajectory_player: Optional[TrajectoryPlayer] = None,
+    openscenario_runner=None,
+    eva_warning_distance_m: float = 20.0,
 ):
     """
     Handle a single WebSocket connection for driving.
@@ -1234,6 +1776,10 @@ async def serve_drive(
 
     ``trajectory_player`` is the server-owned playback singleton; sessions
     issue start/stop/list commands but never own the player.
+
+    ``openscenario_runner`` is the server-owned ScenarioRunner wrapper; the
+    serve_drive task subscribes to its event stream and forwards events to
+    this connection's browser.
     """
     session = DriveSession(
         world=world,
@@ -1241,9 +1787,13 @@ async def serve_drive(
         api_fetcher=api_fetcher,
         shared_prop_pool=shared_prop_pool,
         trajectory_player=trajectory_player,
+        openscenario_runner=openscenario_runner,
+        eva_warning_distance_m=eva_warning_distance_m,
     )
     frame_task = None
     frame_stop = asyncio.Event()
+    xosc_task = None
+    xosc_queue = None
 
     async def stream_frames():
         """Send MJPEG frames at ~20fps as binary WebSocket messages."""
@@ -1260,6 +1810,27 @@ async def serve_drive(
                 except Exception:
                     break
             await asyncio.sleep(0.05)  # 20fps cap
+
+    async def pump_xosc_events():
+        """Forward OpenSCENARIO events from the runner queue to this socket."""
+        if xosc_queue is None:
+            return
+        while True:
+            try:
+                event = await xosc_queue.get()
+            except asyncio.CancelledError:
+                raise
+            try:
+                await websocket.send(json.dumps(event))
+            except Exception:
+                break
+
+    if openscenario_runner is not None:
+        try:
+            xosc_queue = openscenario_runner.subscribe()
+            xosc_task = asyncio.create_task(pump_xosc_events())
+        except Exception as e:
+            logger.debug("OpenSCENARIO subscribe failed: %s", e)
 
     try:
         async for raw_message in websocket:
@@ -1288,6 +1859,15 @@ async def serve_drive(
                 await frame_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        if xosc_task is not None:
+            xosc_task.cancel()
+            try:
+                await xosc_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if openscenario_runner is not None and xosc_queue is not None:
+            openscenario_runner.unsubscribe(xosc_queue)
 
         session._force_cleanup()
         if session in _active_sessions:

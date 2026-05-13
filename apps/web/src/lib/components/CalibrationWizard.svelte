@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { rawAxes, calibration, gamepadConnected, gamepadName, recalibrateRestValues } from '$lib/stores/gamepad';
+	import { rawAxes, calibration, gamepadConnected, gamepadName, recalibrateRestValues, applyDefaultRests } from '$lib/stores/gamepad';
+	import { DEFAULT_CALIBRATION } from '$lib/constants';
 	import type { GamepadCalibration } from '$lib/types';
 
 	interface Props {
@@ -69,7 +70,39 @@
 		}
 	}
 
+	// Abandon the current detection and let the user re-trigger it.
+	function redoDetection() {
+		detecting = false;
+		detectedAxis = -1;
+		maxDelta = 0;
+	}
+
+	// Step backward so a mis-calibrated axis can be redone.
+	function goBack() {
+		if (detecting) {
+			detecting = false;
+			detectedAxis = -1;
+			maxDelta = 0;
+			return;
+		}
+		if (step > 0) {
+			step--;
+			delete result[steps[step].key];
+			detectedAxis = -1;
+			maxDelta = 0;
+		}
+	}
+
+	// Apply hardcoded DEFAULT_CALIBRATION (axes + G923 rest values). Skipping
+	// detection prevents a held pedal from being captured as rest.
 	function skipCalibration() {
+		calibration.update((c) => ({
+			...c,
+			steerAxis: DEFAULT_CALIBRATION.steerAxis,
+			gasAxis: DEFAULT_CALIBRATION.gasAxis,
+			brakeAxis: DEFAULT_CALIBRATION.brakeAxis,
+		}));
+		applyDefaultRests();
 		onComplete();
 	}
 </script>
@@ -131,10 +164,18 @@
 			</div>
 
 			{#if !detecting}
-				<button onclick={startDetection}
-					class="w-full py-3.5 bg-accent hover:bg-red-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.3)] hover:shadow-[0_0_30px_rgba(220,38,38,0.5)] cursor-pointer">
-					Start Detection
-				</button>
+				<div class="flex gap-2">
+					{#if step > 0}
+						<button onclick={goBack}
+							class="px-4 py-3.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-gray-300 transition-all duration-200 cursor-pointer">
+							Back
+						</button>
+					{/if}
+					<button onclick={startDetection}
+						class="flex-1 py-3.5 bg-accent hover:bg-red-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.3)] hover:shadow-[0_0_30px_rgba(220,38,38,0.5)] cursor-pointer">
+						Start Detection
+					</button>
+				</div>
 			{:else}
 				<div class="mb-4">
 					<!-- Axis grid — visual bars instead of raw numbers -->
@@ -163,14 +204,38 @@
 							<div class="w-2 h-2 bg-green-500 rounded-full shadow-[0_0_6px_rgba(34,197,94,0.5)]"></div>
 							<span class="text-sm font-body text-green-400/80 tracking-wider">DETECTED: AXIS {detectedAxis}</span>
 						</div>
-						<button onclick={confirmAxis}
-							class="w-full py-3.5 bg-green-600 hover:bg-green-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_15px_rgba(34,197,94,0.2)] hover:shadow-[0_0_25px_rgba(34,197,94,0.4)] cursor-pointer">
-							Confirm Axis {detectedAxis}
-						</button>
+						<div class="flex gap-2">
+							{#if step > 0}
+								<button onclick={goBack}
+									class="px-4 py-3.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-gray-300 transition-all duration-200 cursor-pointer">
+									Back
+								</button>
+							{/if}
+							<button onclick={redoDetection}
+								class="px-4 py-3.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-gray-300 transition-all duration-200 cursor-pointer">
+								Redo
+							</button>
+							<button onclick={confirmAxis}
+								class="flex-1 py-3.5 bg-green-600 hover:bg-green-500 rounded-xl text-sm font-display font-bold tracking-widest uppercase text-white transition-all duration-200 shadow-[0_0_15px_rgba(34,197,94,0.2)] hover:shadow-[0_0_25px_rgba(34,197,94,0.4)] cursor-pointer">
+								Confirm Axis {detectedAxis}
+							</button>
+						</div>
 					{:else}
 						<div class="flex items-center justify-center gap-2 py-3">
 							<div class="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
 							<span class="text-sm font-body text-yellow-500/80 tracking-wider animate-pulse">MOVE THE CONTROL...</span>
+						</div>
+						<div class="flex gap-2">
+							{#if step > 0}
+								<button onclick={goBack}
+									class="flex-1 py-2.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-xs font-display font-bold tracking-widest uppercase text-gray-300 transition-all duration-200 cursor-pointer">
+									Back
+								</button>
+							{/if}
+							<button onclick={redoDetection}
+								class="flex-1 py-2.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-xs font-display font-bold tracking-widest uppercase text-gray-300 transition-all duration-200 cursor-pointer">
+								Cancel
+							</button>
 						</div>
 					{/if}
 				</div>

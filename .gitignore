@@ -6,3 +6,6 @@ node_modules/
 dist/
 build/
 __pycache__/
+AGENTS.md
+.claude/
+.omx/

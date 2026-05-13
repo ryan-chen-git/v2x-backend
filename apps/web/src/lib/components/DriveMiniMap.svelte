@@ -2,10 +2,12 @@
 	import { onMount, onDestroy } from 'svelte';
 	import maplibregl from 'maplibre-gl';
 	import { MAP_CENTER, DEFAULT_ZOOM, MAP_STYLE_URL } from '$lib/constants';
-	import { telemetry } from '$lib/stores/driveSocket';
+	import { dynamicActors, telemetry } from '$lib/stores/driveSocket';
 	import { v2xZones } from '$lib/stores/v2xZones';
 	import { carlaToGps } from '$lib/stores/v2xZones';
-	import type { V2xZone } from '$lib/types';
+	import { shouldDrawZone } from '$lib/zoneRules';
+	import { buildActorGeofencePolygon, DYNAMIC_GEOFENCE_COLOR } from '$lib/actorGeofenceRules';
+	import type { DynamicActor, V2xZone } from '$lib/types';
 
 	interface Props {
 		roadLines: number[][][];
@@ -21,6 +23,8 @@
 	let carMarker: maplibregl.Marker | null = null;
 	let mapReady = $state(false);
 	let expanded = $state(false);
+	let drawableZoneCount = $derived($v2xZones.filter(shouldDrawZone).length);
+	let dynamicActorGeofenceSignature = '';
 
 	onMount(() => {
 		map = new maplibregl.Map({
@@ -88,6 +92,33 @@
 				},
 			});
 
+			// Moving geofences follow dynamic autopilot actors.
+			const initialDynamicActors = $dynamicActors;
+			dynamicActorGeofenceSignature = getDynamicActorGeofenceSignature(initialDynamicActors);
+			map.addSource('dynamic-actor-geofences', {
+				type: 'geojson',
+				data: buildDynamicActorGeofenceGeoJSON(initialDynamicActors),
+			});
+			map.addLayer({
+				id: 'dynamic-actor-geofences-fill',
+				type: 'fill',
+				source: 'dynamic-actor-geofences',
+				paint: {
+					'fill-color': ['get', 'color'],
+					'fill-opacity': 0.18,
+				},
+			});
+			map.addLayer({
+				id: 'dynamic-actor-geofences-outline',
+				type: 'line',
+				source: 'dynamic-actor-geofences',
+				paint: {
+					'line-color': ['get', 'color'],
+					'line-width': 2,
+					'line-opacity': 0.85,
+				},
+			});
+
 			// Nearby actors layer (traffic vehicles + other actors)
 			map.addSource('nearby-actors', {
 				type: 'geojson',
@@ -101,6 +132,7 @@
 					'circle-radius': 4,
 					'circle-color': [
 						'match', ['get', 'type'],
+						'dynamic', '#ef4444',  // red for moving geofence actors
 						'traffic', '#f59e0b',  // amber for NPC traffic
 						'#94a3b8',             // gray for other vehicles
 					],
@@ -135,6 +167,44 @@
 					geometry: { type: 'Point' as const, coordinates: [lon, lat] },
 					properties: { id: a.id, type: a.type },
 				};
+			}),
+		};
+	}
+
+	function getDynamicActorGeofenceSignature(actors: DynamicActor[]): string {
+		return actors
+			.map((actor) => [
+				actor.actor_id,
+				actor.pos?.[0],
+				actor.pos?.[1],
+				actor.pos?.[2],
+				actor.yaw,
+				actor.geofence_radius,
+				actor.name,
+			].join(':'))
+			.sort()
+			.join('|');
+	}
+
+	function buildDynamicActorGeofenceGeoJSON(actors: DynamicActor[]): GeoJSON.FeatureCollection {
+		return {
+			type: 'FeatureCollection',
+			features: actors.flatMap((actor) => {
+				const polygon = buildActorGeofencePolygon(actor, originLat, originLon);
+				if (polygon.length < 4) return [];
+
+				return [{
+					type: 'Feature' as const,
+					geometry: {
+						type: 'Polygon' as const,
+						coordinates: [polygon],
+					},
+					properties: {
+						actor_id: actor.actor_id,
+						name: actor.name,
+						color: DYNAMIC_GEOFENCE_COLOR,
+					},
+				}];
 			}),
 		};
 	}
@@ -176,6 +246,19 @@
 		}
 	});
 
+	// Update moving geofence overlays on every dynamic actor store change.
+	$effect(() => {
+		const actors = $dynamicActors;
+		if (!map || !mapReady) return;
+		const signature = getDynamicActorGeofenceSignature(actors);
+		if (signature === dynamicActorGeofenceSignature) return;
+		const source = map.getSource('dynamic-actor-geofences') as maplibregl.GeoJSONSource | undefined;
+		if (source) {
+			source.setData(buildDynamicActorGeofenceGeoJSON(actors));
+			dynamicActorGeofenceSignature = signature;
+		}
+	});
+
 	function buildRoadGeoJSON(lines: number[][][]): GeoJSON.FeatureCollection {
 		return {
 			type: 'FeatureCollection',
@@ -191,7 +274,7 @@
 		return {
 			type: 'FeatureCollection',
 			features: zones
-				.filter((z) => z.polygon.length >= 3)
+				.filter((z) => shouldDrawZone(z) && z.polygon.length >= 3)
 				.map((z) => ({
 					type: 'Feature' as const,
 					geometry: {
@@ -201,6 +284,7 @@
 					properties: {
 						color: z.color,
 						name: z.name,
+						zone_kind: z.zone_kind,
 					},
 				})),
 		};
@@ -239,9 +323,9 @@
 	</div>
 
 	<!-- Zone count badge -->
-	{#if $v2xZones.length > 0}
+	{#if drawableZoneCount > 0 || $dynamicActors.length > 0}
 		<div class="absolute bottom-1 right-1 rounded bg-gray-900/80 px-1.5 py-0.5 text-[9px] font-medium text-gray-400">
-			{$v2xZones.length} zone{$v2xZones.length !== 1 ? 's' : ''}
+			{drawableZoneCount} static / {$dynamicActors.length} moving
 		</div>
 	{/if}
 </div>
