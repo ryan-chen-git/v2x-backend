@@ -1,0 +1,28 @@
+[Unit]
+Description=V2X CARLA Drive Server
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=path
+Group=path
+SupplementaryGroups=docker
+WorkingDirectory=/home/path/V2XCarla/v2x-backend
+Environment=AWS_PROFILE=Path-Emerging-Dev-147229569658
+Environment=CARLA_PORT=2000
+Environment=WS_PORT=8765
+Environment=VENV=/home/path/V2XCarla/carla-venv/bin/activate
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/home/path/V2XCarla/v2x-backend/scripts/wait-for-carla.sh
+ExecStart=/home/path/V2XCarla/v2x-backend/scripts/launch-drive.sh
+Restart=always
+RestartSec=10
+TimeoutStartSec=700
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=V2X Cloudflare Drive Quick Tunnel
+Wants=network-online.target v2x-drive.service
+After=network-online.target v2x-drive.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=path
+Group=path
+WorkingDirectory=/home/path
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8765 --logfile /tmp/v2x-cloudflared.log --loglevel info
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
